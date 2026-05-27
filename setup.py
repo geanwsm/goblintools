@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="goblintools",
-    version="0.7.6",
+    version="0.7.8",
     packages=find_packages(),
     install_requires=[
         "patool",
@@ -12,6 +12,7 @@ setup(
         "numpy",
         "pdf2image",
         "pypdf>=6.10.2",
+        "cryptography>=3.1",
         "beautifulsoup4",
         "striprtf",
         "dbfread",
