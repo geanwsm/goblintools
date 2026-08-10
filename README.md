@@ -29,7 +29,7 @@ goblintools/
 
 1. **Text extraction**: File → parser by extension; if unknown or **no extension**, magic-byte sniffing (PDF, RTF, Office Open XML) → extracted text (with `file_path_pwd` tag)
 2. **Folder extraction**: Each file’s tag uses the **path relative to the folder** (as inside a zip), e.g. `edital/arquivo.pdf` not the full filesystem path
-3. **PDF text**: [pypdf](https://pypi.org/project/pypdf/) (≥ 6.10.2) with built-in workarounds for common producer bugs (e.g. font widths as indirect references). The reader tries the file as-is, merges text from an internal resave when some pages fail, then uses plain and layout extraction modes. **Optional OCR** (`ocr_handler=True`): full-document OCR when the PDF has images but almost no text, or **per-page OCR** only for pages PyPDF still cannot decode (requires Poppler for `pdf2image` and Tesseract for local OCR)
+3. **PDF text**: [pypdf](https://pypi.org/project/pypdf/) (≥ 6.15.0) with built-in workarounds for common producer bugs (e.g. font widths as indirect references). The reader tries the file as-is, merges text from an internal resave when some pages fail, then uses plain and layout extraction modes. **Optional OCR** (`ocr_handler=True`): full-document OCR when the PDF has images but almost no text, or **per-page OCR** only for pages PyPDF still cannot decode (requires Poppler for `pdf2image` and Tesseract for local OCR)
 4. **PDF tables** (opt-in on `TextExtractor`): with `extract_tables=True`, [pdfplumber](https://pypi.org/project/pdfplumber/) detects tables on each page; the library filters one-column text boxes, collapses split headers, merges continuation rows, and appends Markdown tables after that page’s text (or returns structured matrices via `extract_tables_from_pdf`)
 5. **Structured extraction** (parallel API): `StructuredExtractor` extracts item-oriented tables from PDF / XLSX / CSV / DOCX into matrices + quality scores, and can render MinerU-compatible `full.md` with HTML `<table>` blocks — **without changing** plain `TextExtractor` behaviour
 6. **Archive extraction**: Format handler → extract to temp → flatten with stable names (extensionless entries preserved) → optionally remove source. Misnamed archives (e.g. `.zip` that is a PDF) use **magic-byte fallbacks**
@@ -45,7 +45,7 @@ pip install goblintools
 ## Requirements
 
 - **Python**: 3.9 or newer
-- **pypdf**: 6.10.2 or newer (declared in package metadata; used for PDF text extraction)
+- **pypdf**: 6.15.0 or newer (declared in package metadata; used for PDF text extraction)
 - **pdfplumber**: Used for optional PDF table detection (`extract_tables=True` / `extract_tables_from_pdf`)
 - **Tesseract OCR**: Required for local OCR support ([Installation Guide](https://github.com/tesseract-ocr/tesseract))
   - **Portuguese Language Pack**: Install `tesseract-ocr-por` for Portuguese text recognition
@@ -54,7 +54,7 @@ pip install goblintools
 
 ### PDF extraction notes
 
-- Importing `TextExtractor` applies **pypdf workarounds** once (idempotent): safer handling of indirect `/Widths` and `space_width` values that otherwise trigger `TypeError` during `extract_text()`.
+- Importing `TextExtractor` applies **pypdf workarounds** once (idempotent): on older pypdf, safer `/Widths` / `space_width` handling; on pypdf 6.15+ the stock text extractor is kept (legacy monkey-patches would break RTL helpers) and only light font-width guards are applied.
 - If your pypdf build exposes `MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH` on `pypdf.filters`, the library increases that limit slightly so very large but legitimate content streams can still be decoded; if the attribute is missing (some forks or versions), that step is skipped automatically.
 - For scanned PDFs or pages with no usable text layer, enable **`TextExtractor(ocr_handler=True)`** and install Poppler + Tesseract.
 - Table extraction targets **native (digital) PDFs** with a text layer and visible table structure. Scanned pages need OCR first; table detection from scans (Textract TABLES / img2table) is not wired yet.
@@ -645,7 +645,7 @@ Install system tools: `unrar` and `p7zip`. See [Archive Support](#archive-suppor
 
 - **PyPDF reliability**: Runtime fixes for `IndirectObject` font metrics and related `extract_text()` failures on real-world editais; compatible with pypdf versions that omit `MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH` on `pypdf.filters`.
 - **PDF extraction flow**: Read original PDF first, merge with an internal resave when needed, try multiple extraction modes, optional per-page OCR for gaps when `ocr_handler=True`.
-- **Python**: Minimum version remains 3.9; `pypdf>=6.10.2` is required.
+- **Python**: Minimum version remains 3.9; `pypdf>=6.15.0` is required.
 
 ---
 

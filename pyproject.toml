@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "goblintools"
-version = "0.9.0"
+version = "0.9.1"
 description = "Toolkit for archive extraction, OCR parsing, and file text extraction"
 authors = [{ name="Gean Matos", email="gean@webgoal.com.br" }]
 readme = "README.md"
@@ -17,7 +17,7 @@ dependencies = [
     "opencv-python-headless",
     "numpy",
     "pdf2image",
-    "pypdf>=6.10.2",
+    "pypdf>=6.15.0",
     "pdfplumber",
     "cryptography>=3.1",
     "beautifulsoup4",

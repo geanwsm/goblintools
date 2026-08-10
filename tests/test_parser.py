@@ -137,6 +137,88 @@ def test_pypdf_workarounds_idempotent():
     apply_pypdf_extraction_workarounds()
 
 
+def test_pypdf_workarounds_tolerates_int_cmap_and_bad_encoding():
+    """On legacy pypdf, patched get_display_str must accept int cmap values."""
+    from goblintools.pypdf_workarounds import (
+        apply_pypdf_extraction_workarounds,
+        _uses_legacy_rtl_api,
+    )
+    import pypdf._text_extraction as te
+    import pytest
+
+    apply_pypdf_extraction_workarounds(force=True)
+    if not _uses_legacy_rtl_api():
+        pytest.skip("legacy get_display_str patch not applied on modern pypdf")
+
+    class BadFont:
+        character_map = {"A": 65, "B": "B"}
+        space_width = 250
+        encoding = object()
+        def text_width(self, x):
+            return 10 * len(x)
+
+    text, rtl, widths = te.get_display_str(
+        "",
+        [1, 0, 0, 1, 0, 0],
+        [1, 0, 0, 1, 0, 0],
+        None,
+        BadFont(),
+        "AB",
+        12,
+        False,
+        None,
+    )
+    assert "A" in text and "B" in text
+    assert widths > 0
+
+    out, is_str = te.get_text_operands(
+        [b"AB"],
+        [1, 0, 0, 1, 0, 0],
+        [1, 0, 0, 1, 0, 0],
+        BadFont(),
+        (0, 90, 180, 270),
+    )
+    assert is_str is False
+    assert isinstance(out, str)
+
+
+def test_pypdf_workarounds_modern_keeps_stock_display_str():
+    """On pypdf 6.15+, workarounds must not break stock extraction with str RTL consts."""
+    from goblintools.pypdf_workarounds import (
+        apply_pypdf_extraction_workarounds,
+        _uses_legacy_rtl_api,
+    )
+    import pypdf._text_extraction as te
+    import pytest
+
+    apply_pypdf_extraction_workarounds(force=True)
+    if _uses_legacy_rtl_api():
+        pytest.skip("modern path not used on this pypdf")
+
+    assert isinstance(te.CUSTOM_RTL_MIN, str)
+    # Stock function still present and callable with a minimal fake font
+    class Font:
+        character_map = {}
+        space_width = 250
+        space_char = " "
+        def get_text_width(self, text):
+            return 10 * len(text)
+
+    text, rtl, widths = te.get_display_str(
+        "",
+        [1, 0, 0, 1, 0, 0],
+        [1, 0, 0, 1, 0, 0],
+        None,
+        Font(),
+        "AB",
+        12,
+        False,
+        None,
+    )
+    assert text == "AB"
+    assert widths > 0
+
+
 def test_merge_page_texts_prefers_primary_then_secondary():
     """_merge_page_texts keeps primary when present and fills blanks from secondary."""
     extractor = TextExtractor()
