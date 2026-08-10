@@ -38,3 +38,7 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/geanatelie/goblintools.git"
 Repository = "https://github.com/geanatelie/goblintools.git"
+
+[tool.setuptools.packages.find]
+include = ["goblintools*"]
+exclude = ["tests*"]
