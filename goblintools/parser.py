@@ -25,6 +25,11 @@ from goblintools.ocr_parser import OCRProcessor
 from goblintools.config import GoblinConfig, OCRConfig
 from goblintools.log_policy import _set_suppress_warnings, log_warning
 from goblintools.file_handling import FileValidator
+from goblintools.table_extractor import (
+    extract_pdf_tables,
+    format_tables_for_page,
+    tables_by_page,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +59,8 @@ class TextExtractor:
         aws_region='us-east-1',
         config: Optional[GoblinConfig] = None,
         suppress_warnings: Optional[bool] = None,
+        extract_tables: bool = False,
+        table_format: str = "markdown",
     ):
         """
         Initialize the text extractor.
@@ -69,6 +76,9 @@ class TextExtractor:
                 If None (default), leaves the current setting unchanged (use
                 ``goblintools.configure(suppress_warnings=True)`` at startup, or pass
                 ``FileManager(suppress_warnings=True)`` before extraction).
+            extract_tables: When True, detect PDF tables (pdfplumber) and embed them
+                in the extracted text (currently Markdown only).
+            table_format: Output format for embedded tables (``"markdown"``).
         """
         self.config = config or GoblinConfig.default()
 
@@ -78,6 +88,13 @@ class TextExtractor:
 
         if suppress_warnings is not None:
             _set_suppress_warnings(suppress_warnings)
+
+        if table_format != "markdown":
+            raise ValueError(
+                f"Unsupported table_format={table_format!r}; only 'markdown' is supported"
+            )
+        self.extract_tables = extract_tables
+        self.table_format = table_format
 
         if ocr_handler:
             self.ocr_handler = OCRProcessor(self.config.ocr)
@@ -191,6 +208,15 @@ class TextExtractor:
                     all_texts.append(text)
 
         return '\n\n'.join(all_texts)
+
+    def extract_tables_from_pdf(
+        self, file_path: str, *, max_pages: Optional[int] = None
+    ) -> List[Dict]:
+        """Extract structured tables from a PDF (pdfplumber).
+
+        Returns a list of dicts with keys ``page`` (1-based), ``index``, and ``rows``.
+        """
+        return extract_pdf_tables(file_path, max_pages=max_pages)
 
     def pdf_needs_ocr(self, file_path: str) -> bool:
         """Check if PDF needs OCR processing"""
@@ -364,6 +390,9 @@ class TextExtractor:
                     if idx in ocr_by_page and ocr_by_page[idx]:
                         page_texts[idx] = ocr_by_page[idx]
 
+            if self.extract_tables and page_texts:
+                page_texts = self._merge_tables_into_page_texts(file_path, page_texts)
+
             extracted_text = "\n".join(page_texts)
 
         except Exception as e:
@@ -386,6 +415,40 @@ class TextExtractor:
             )
 
         return extracted_text
+
+    def _merge_tables_into_page_texts(
+        self, file_path: str, page_texts: List[str]
+    ) -> List[str]:
+        """Append Markdown tables after each page's pypdf text."""
+        try:
+            tables = extract_pdf_tables(file_path, max_pages=len(page_texts))
+        except ImportError as e:
+            log_warning(logger, str(e))
+            return page_texts
+        except Exception as e:
+            log_warning(logger, f"Table extraction skipped for {file_path}: {e}")
+            return page_texts
+
+        if not tables:
+            return page_texts
+
+        by_page = tables_by_page(tables)
+        merged: List[str] = []
+        for i, text in enumerate(page_texts):
+            page_num = i + 1
+            page_tables = by_page.get(page_num, [])
+            if not page_tables:
+                merged.append(text)
+                continue
+            block = format_tables_for_page(
+                page_tables, page=page_num, table_format=self.table_format
+            )
+            if block:
+                base = text.rstrip()
+                merged.append(f"{base}\n\n{block}" if base else block)
+            else:
+                merged.append(text)
+        return merged
 
     def _extract_docx(self, file_path: str) -> str:
         """Extract text from DOCX files."""

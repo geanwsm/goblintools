@@ -7,13 +7,15 @@
 
 ## Overview
 
-GoblinTools provides a unified toolkit for extracting text from documents (PDF, DOCX, XLSX, etc.), handling archives (ZIP, RAR, 7z, 30+ formats), and cleaning text with Brazilian Portuguese support. OCR can use local Tesseract or AWS Textract. When AWS credentials are missing, the library falls back to local Tesseract with a warning.
+GoblinTools provides a unified toolkit for extracting text from documents (PDF, DOCX, XLSX, etc.), handling archives (ZIP, RAR, 7z, 30+ formats), and cleaning text with Brazilian Portuguese support. OCR can use local Tesseract or AWS Textract. When AWS credentials are missing, the library falls back to local Tesseract with a warning. For native PDFs, optional **table extraction** (via [pdfplumber](https://pypi.org/project/pdfplumber/)) can detect grids and embed them as Markdown or return structured row matrices — useful for editais, planilhas orçamentárias, and similar bidding documents.
 
 ### Architecture
 
 ```
 goblintools/
 ├── parser.py             # TextExtractor - main extraction, format parsers
+├── table_extractor.py    # PDF table detection (pdfplumber), Markdown, quality filters
+├── structured/           # Parallel StructuredExtractor (HTML tables + quality gate)
 ├── pypdf_workarounds.py  # PyPDF monkey-patches (indirect font metrics, optional stream cap)
 ├── file_handling.py      # FileManager, ArchiveHandler, FileValidator
 ├── text_cleaner.py       # TextCleaner - clean_text, remove_text_noise, stopwords
@@ -28,7 +30,9 @@ goblintools/
 1. **Text extraction**: File → parser by extension; if unknown or **no extension**, magic-byte sniffing (PDF, RTF, Office Open XML) → extracted text (with `file_path_pwd` tag)
 2. **Folder extraction**: Each file’s tag uses the **path relative to the folder** (as inside a zip), e.g. `edital/arquivo.pdf` not the full filesystem path
 3. **PDF text**: [pypdf](https://pypi.org/project/pypdf/) (≥ 6.10.2) with built-in workarounds for common producer bugs (e.g. font widths as indirect references). The reader tries the file as-is, merges text from an internal resave when some pages fail, then uses plain and layout extraction modes. **Optional OCR** (`ocr_handler=True`): full-document OCR when the PDF has images but almost no text, or **per-page OCR** only for pages PyPDF still cannot decode (requires Poppler for `pdf2image` and Tesseract for local OCR)
-4. **Archive extraction**: Format handler → extract to temp → flatten with stable names (extensionless entries preserved) → optionally remove source. Misnamed archives (e.g. `.zip` that is a PDF) use **magic-byte fallbacks**
+4. **PDF tables** (opt-in on `TextExtractor`): with `extract_tables=True`, [pdfplumber](https://pypi.org/project/pdfplumber/) detects tables on each page; the library filters one-column text boxes, collapses split headers, merges continuation rows, and appends Markdown tables after that page’s text (or returns structured matrices via `extract_tables_from_pdf`)
+5. **Structured extraction** (parallel API): `StructuredExtractor` extracts item-oriented tables from PDF / XLSX / CSV / DOCX into matrices + quality scores, and can render MinerU-compatible `full.md` with HTML `<table>` blocks — **without changing** plain `TextExtractor` behaviour
+6. **Archive extraction**: Format handler → extract to temp → flatten with stable names (extensionless entries preserved) → optionally remove source. Misnamed archives (e.g. `.zip` that is a PDF) use **magic-byte fallbacks**
 
 ---
 
@@ -42,6 +46,7 @@ pip install goblintools
 
 - **Python**: 3.9 or newer
 - **pypdf**: 6.10.2 or newer (declared in package metadata; used for PDF text extraction)
+- **pdfplumber**: Used for optional PDF table detection (`extract_tables=True` / `extract_tables_from_pdf`)
 - **Tesseract OCR**: Required for local OCR support ([Installation Guide](https://github.com/tesseract-ocr/tesseract))
   - **Portuguese Language Pack**: Install `tesseract-ocr-por` for Portuguese text recognition
 - **Poppler**: Required when using OCR on PDFs (`pdf2image`); install `poppler-utils` (Debian/Ubuntu) or your OS equivalent
@@ -52,6 +57,7 @@ pip install goblintools
 - Importing `TextExtractor` applies **pypdf workarounds** once (idempotent): safer handling of indirect `/Widths` and `space_width` values that otherwise trigger `TypeError` during `extract_text()`.
 - If your pypdf build exposes `MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH` on `pypdf.filters`, the library increases that limit slightly so very large but legitimate content streams can still be decoded; if the attribute is missing (some forks or versions), that step is skipped automatically.
 - For scanned PDFs or pages with no usable text layer, enable **`TextExtractor(ocr_handler=True)`** and install Poppler + Tesseract.
+- Table extraction targets **native (digital) PDFs** with a text layer and visible table structure. Scanned pages need OCR first; table detection from scans (Textract TABLES / img2table) is not wired yet.
 
 ---
 
@@ -89,6 +95,8 @@ For complete archive format support, install these system tools (required by `pa
 - **File Path Tagging**: Automatically includes file path metadata in extracted text (relative paths for folder extraction)
 - **Extensionless files**: PDFs and other types without a filename extension are detected from content
 - **Robust PDF pipeline**: PyPDF workarounds, resave merge for partial failures, optional targeted OCR for stubborn pages when an OCR handler is configured
+- **PDF table extraction**: Opt-in pdfplumber detection with quality filters; embed Markdown in extracted text or get structured `rows` matrices
+- **Structured extraction**: Parallel `StructuredExtractor` for PDF/XLSX/CSV/DOCX → HTML `full.md` + `ok_for_items` quality gate (plain text path unchanged)
 - **Quiet logs**: Optional suppression of GoblinTools warning logs via `configure()` or constructor flags
 
 ---
@@ -107,6 +115,78 @@ print(text[:200] + "..." if text else "No text extracted")
 # Output includes file path tag:
 # file_path_pwd:"document.pdf"
 # [extracted text content...]
+```
+
+### PDF table extraction
+
+By default, PDF text is flattened (columns lost). Enable tables with `extract_tables=True` to append Markdown tables after each page’s text, or call `extract_tables_from_pdf` for structured data.
+
+```python
+from goblintools import TextExtractor, extract_pdf_tables, table_to_markdown
+
+# 1) Embed Markdown tables in the usual str output (good for LLM / RAG)
+extractor = TextExtractor(extract_tables=True)  # table_format="markdown"
+text = extractor.extract_from_file("edital.pdf")
+# file_path_pwd:"edital.pdf"
+# ...page text...
+#
+# <!-- table page=26 index=0 -->
+# | ITEM | DESCRIÇÃO | CÓDIGO | UND. | QUANT | VALOR . UNT. | VALOR TOTAL |
+# | --- | --- | --- | --- | --- | --- | --- |
+# | 1. | ... | ... | SERV | 12 | R$ 16.511,45 | R$ 198.137,40 |
+
+# 2) Structured matrices (page is 1-based)
+tables = extractor.extract_tables_from_pdf("edital.pdf")
+# [{"page": 26, "index": 0, "rows": [["ITEM", ...], ["1.", ...], ...]}, ...]
+
+# Optional page limit for large editais
+tables = extractor.extract_tables_from_pdf("edital.pdf", max_pages=40)
+
+# Helpers also importable directly
+tables = extract_pdf_tables("edital.pdf")
+print(table_to_markdown(tables[0]["rows"]))
+```
+
+What the pipeline does before returning tables:
+
+- Drops likely false positives (e.g. single-column bordered text)
+- Removes empty rows, collapses split headers, merges continuation lines into the previous item row
+
+`extract_tables=False` (default) leaves PDF extraction unchanged.
+
+Dev helper at the repo root:
+
+```bash
+python scripts/dev_extract_tables.py --max-pages 40
+python scripts/dev_extract_tables.py --all-pages
+```
+
+### Structured extraction (parallel to plain text)
+
+Use this when you need **HTML tables** and an item-quality gate (e.g. bidding item pipelines). It does **not** alter `TextExtractor.extract_from_file`.
+
+```python
+from goblintools import StructuredExtractor
+# or: from goblintools.structured import StructuredExtractor
+
+ext = StructuredExtractor()
+doc = ext.extract_from_file("edital.pdf")
+# doc.tables -> List[TableBlock] with rows + quality
+# doc.ok_for_items -> True when at least one table looks like ITEM/DESCRIÇÃO/QTD
+
+if doc.ok_for_items:
+    md = ext.to_full_md(doc)          # prose + <table>...</table>
+    ext.write_full_md(doc, "out/full.md")
+
+# Also: .xlsx / .xlsm / .csv / .docx
+docs = ext.extract_from_folder("prepared/")
+```
+
+Supported suffixes: `.pdf`, `.docx`, `.xlsx`, `.xlsm`, `.csv`. Other formats return an empty document with `ok_for_items=False`.
+
+```bash
+python scripts/dev_structured_extract.py --max-pages 40
+python scripts/dev_structured_extract.py path/to/file.xlsx --write-md /tmp/out
 ```
 
 ### OCR-Enabled Extraction
@@ -417,9 +497,10 @@ Import from the package: `from goblintools import configure` (or `import goblint
 - `configure(suppress_warnings=None)` - If `True` / `False`, sets whether GoblinTools emits warning logs for the process. Omit or pass `None` for no change.
 
 ### TextExtractor
-- `__init__(ocr_handler=False, use_aws=False, aws_access_key=None, aws_secret_key=None, aws_region='us-east-1', config=None, suppress_warnings=None)` - `suppress_warnings`: if `True`/`False`, updates library warning policy; if `None`, leaves current setting (e.g. from `configure()`)
+- `__init__(ocr_handler=False, use_aws=False, aws_access_key=None, aws_secret_key=None, aws_region='us-east-1', config=None, suppress_warnings=None, extract_tables=False, table_format='markdown')` - `suppress_warnings`: if `True`/`False`, updates library warning policy; if `None`, leaves current setting (e.g. from `configure()`). `extract_tables`: when `True`, detect PDF tables with pdfplumber and embed them in the text. `table_format`: currently only `"markdown"`
 - `extract_from_file(file_path, display_path=None)` - Extract text from single file. Returns `str` with `file_path_pwd` tag; optional `display_path` overrides the tag path
 - `extract_from_folder(folder_path)` - Extract text from all files in folder (recursively). Tags use **paths relative to** `folder_path`
+- `extract_tables_from_pdf(file_path, max_pages=None)` - Return a list of `{"page", "index", "rows"}` from a PDF (does not require `extract_tables=True` on the constructor)
 - `pdf_needs_ocr(pdf_path)` - Check if PDF requires OCR processing
 - `add_parser(extension, parser_func)` - Add custom parser for file extension
 - `validate_installation()` - Check if dependencies are properly installed
@@ -428,6 +509,15 @@ Import from the package: `from goblintools import configure` (or `import goblint
 - Always returns `str` (string) with extracted text
 - Each file's text is prefixed with a `file_path_pwd:"…"` tag (relative path for folder extraction)
 - Multiple files are joined with blank lines between segments
+- With `extract_tables=True`, Markdown tables are appended per page after markers like `<!-- table page=N index=M -->`
+
+### Table helpers
+Import from the package: `from goblintools import extract_pdf_tables, table_to_markdown, is_meaningful_table, normalize_table_rows`.
+
+- `extract_pdf_tables(pdf_path, max_pages=None, ...)` - Detect and normalize tables; returns `[{"page", "index", "rows"}, ...]`
+- `table_to_markdown(rows, header=True)` - Convert a cell matrix to a GitHub-flavored Markdown table
+- `normalize_table_rows(rows)` - Drop empty rows, collapse split headers, merge continuation rows
+- `is_meaningful_table(rows)` - Quality gate used to drop one-column / tiny fragments
 
 ### FileManager
 - `__init__(suppress_warnings=None)` - If `True`/`False`, sets library warning suppression for the process
@@ -494,15 +584,18 @@ goblintools/
 ├── goblintools/           # Package
 │   ├── __init__.py
 │   ├── parser.py          # TextExtractor
+│   ├── table_extractor.py # PDF tables (pdfplumber)
+│   ├── structured/        # StructuredExtractor (parallel API)
 │   ├── file_handling.py   # FileManager, ArchiveHandler, FileValidator
 │   ├── text_cleaner.py    # TextCleaner
 │   ├── config.py          # GoblinConfig, OCRConfig
 │   ├── log_policy.py      # configure()
 │   ├── ocr_parser.py      # OCRProcessor
 │   └── retry.py           # retry_with_backoff
-├── scripts/               # e.g. extract_zip_and_text.py
+├── scripts/               # dev_extract_tables.py, dev_structured_extract.py, ...
 ├── tests/                 # Pytest tests
 │   ├── conftest.py
+│   ├── test_structured/
 │   └── test_*.py
 ├── pytest.ini
 ├── pyproject.toml
@@ -533,12 +626,22 @@ Install system tools: `unrar` and `p7zip`. See [Archive Support](#archive-suppor
 
 ## Escopo e Limites
 
-- **In scope**: Text extraction from documents, spreadsheets, presentations; archive handling; OCR (Tesseract, AWS Textract); text cleaning (Portuguese-focused); file operations.
-- **Out of scope**: Real-time streaming, document conversion to other formats, indexing/search, web scraping. OCR requires Tesseract (local) or AWS credentials (cloud).
+- **In scope**: Text extraction from documents, spreadsheets, presentations; optional native-PDF table extraction (pdfplumber → Markdown / row matrices); parallel `StructuredExtractor` (PDF/XLSX/CSV/DOCX → HTML `full.md` + quality); archive handling; OCR (Tesseract, AWS Textract); text cleaning (Portuguese-focused); file operations.
+- **Out of scope**: Real-time streaming, document conversion to other formats, indexing/search, web scraping. OCR requires Tesseract (local) or AWS credentials (cloud). Table extraction from pure scans (Textract TABLES / img2table) is not included yet.
 
 ---
 
-## Release highlights (0.7.6)
+## Release highlights (0.8.0)
+
+- **StructuredExtractor**: New parallel API (`goblintools.structured`) for item-oriented tables from PDF, XLSX/XLSM, CSV, and DOCX. Renders MinerU-compatible HTML `<table>` `full.md` and exposes `ok_for_items` quality gate. Does **not** change `TextExtractor` defaults or plain-text output.
+- **Quality**: Footer/note row drop, light cell cleanup, itemish header detection (ITEM/DESCRIÇÃO/QTD), qty/value parse rates.
+
+### Earlier (0.7.8)
+
+- **PDF tables**: Opt-in `TextExtractor(extract_tables=True)` embeds Markdown tables in extracted text; `extract_tables_from_pdf` / `extract_pdf_tables` return structured `rows`. Quality filters drop single-column text boxes; headers and continuation rows are normalized.
+- **Dependency**: `pdfplumber` declared for table detection on native PDFs.
+
+### Earlier (0.7.6)
 
 - **PyPDF reliability**: Runtime fixes for `IndirectObject` font metrics and related `extract_text()` failures on real-world editais; compatible with pypdf versions that omit `MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH` on `pypdf.filters`.
 - **PDF extraction flow**: Read original PDF first, merge with an internal resave when needed, try multiple extraction modes, optional per-page OCR for gaps when `ocr_handler=True`.
