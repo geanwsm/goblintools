@@ -159,6 +159,25 @@ def test_is_meaningful_table_accepts_grid():
     )
 
 
+def test_is_meaningful_table_rejects_word_split_prose():
+    rows = [
+        ["OB", "JETO: Co", "ntratação de empresa especializadae"],
+        ["em construção civil parae", "xecução dos", "serviços remanescentes"],
+        ["e complementares dae", "obra dee", "dificação do estacionamento"],
+        ["ampliação do 1º pavimento", ", reformae adequ", "ação das instalações da"],
+    ]
+    assert not is_meaningful_table(rows)
+
+
+def test_is_meaningful_table_keeps_grid_despite_small_sample_split():
+    assert is_meaningful_table(
+        [
+            ["Item", "Qtd", "Valor"],
+            ["1", "10", "100"],
+        ]
+    )
+
+
 def test_drop_empty_rows():
     assert drop_empty_rows([["a", "b"], ["", None], ["c", "d"]]) == [
         ["a", "b"],

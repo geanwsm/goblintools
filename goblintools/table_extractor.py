@@ -138,12 +138,39 @@ def merge_continuation_rows(rows: Sequence[Sequence[Any]]) -> TableRows:
     return [[c or None for c in row] for row in out]
 
 
+_WORD_CHAR = re.compile(r"[A-Za-zÀ-ÿ]")
+DEFAULT_MIN_WORD_SPLIT_SAMPLE = 8
+DEFAULT_MAX_WORD_SPLIT_RATIO = 0.7
+
+def word_split_ratio(rows: Sequence[Sequence[Any]]) -> Tuple[Optional[float], int]:
+    """Fraction of adjacent-cell boundaries (within a row) that cut an
+    alphabetic word with no whitespace between the cells.
+
+    Returns ``(ratio, sample_size)``; ``ratio`` is ``None`` when there are no
+    boundaries to sample (e.g. single-column tables).
+    """
+    total = 0
+    split = 0
+    for row in rows:
+        cells = [_cell_text(c) for c in row]
+        for i in range(len(cells) - 1):
+            a, b = cells[i], cells[i + 1]
+            if not a or not b:
+                continue
+            total += 1
+            if _WORD_CHAR.match(a[-1]) and _WORD_CHAR.match(b[0]):
+                split += 1
+    return (split / total if total else None), total
+
+
 def is_meaningful_table(
     rows: Sequence[Sequence[Any]],
     *,
     min_cols: int = DEFAULT_MIN_COLS,
     min_rows: int = DEFAULT_MIN_ROWS,
     min_filled_cells: int = DEFAULT_MIN_FILLED_CELLS,
+    max_word_split_ratio: float = DEFAULT_MAX_WORD_SPLIT_RATIO,
+    min_word_split_sample: int = DEFAULT_MIN_WORD_SPLIT_SAMPLE,
 ) -> bool:
     """Return True if the matrix looks like a real data table, not a text box."""
     if not rows:
@@ -160,6 +187,9 @@ def is_meaningful_table(
     # At least one row must use 2+ columns (rejects single-column text blocks
     # that were padded or rare 1-col leftovers after cleanup).
     if not any(_filled_count(r) >= 2 for r in non_empty_rows):
+        return False
+    ratio, sample = word_split_ratio(non_empty_rows)
+    if ratio is not None and sample >= min_word_split_sample and ratio > max_word_split_ratio:
         return False
     return True
 
@@ -323,6 +353,13 @@ def extract_pdf_tables(
                     continue
                 kept_on_page = 0
                 for rows in candidates:
+                    raw_ratio, raw_sample = word_split_ratio(rows)
+                    if (
+                        raw_ratio is not None
+                        and raw_sample >= DEFAULT_MIN_WORD_SPLIT_SAMPLE
+                        and raw_ratio > DEFAULT_MAX_WORD_SPLIT_RATIO
+                    ):
+                        continue
                     if normalize:
                         rows = normalize_table_rows(rows)
                     if not is_meaningful_table(
