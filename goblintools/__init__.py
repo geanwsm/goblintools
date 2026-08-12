@@ -19,4 +19,4 @@ __all__ = [
     'is_meaningful_table', 'normalize_table_rows',
     'StructuredExtractor', 'StructuredDocument',
 ]
-__version__ = '0.9.1'
+__version__ = '0.9.2'
