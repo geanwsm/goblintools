@@ -29,7 +29,7 @@ goblintools/
 
 1. **Text extraction**: File → parser by extension; if unknown or **no extension**, magic-byte sniffing (PDF, RTF, Office Open XML) → extracted text (with `file_path_pwd` tag)
 2. **Folder extraction**: Each file’s tag uses the **path relative to the folder** (as inside a zip), e.g. `edital/arquivo.pdf` not the full filesystem path
-3. **PDF text**: [pypdf](https://pypi.org/project/pypdf/) (≥ 6.15.0) with built-in workarounds for common producer bugs (e.g. font widths as indirect references). The reader tries the file as-is, merges text from an internal resave when some pages fail, then uses plain and layout extraction modes. **Optional OCR** (`ocr_handler=True`): full-document OCR when the PDF has images but almost no text, or **per-page OCR** only for pages PyPDF still cannot decode (requires Poppler for `pdf2image` and Tesseract for local OCR)
+3. **PDF text**: [pypdf](https://pypi.org/project/pypdf/) (≥ 6.15.0) with built-in workarounds for common producer bugs (e.g. font widths as indirect references). The reader tries the file as-is, merges text from an internal resave when some pages fail, then uses plain and layout extraction modes. Pages whose text turns out to be an **undecoded font encoding** (glyph-code garbage — see below) are retried with pdfplumber, then handed to OCR per page. **Optional OCR** (`ocr_handler=True`): full-document OCR when the PDF has images but almost no text, or **per-page OCR** for pages PyPDF still cannot decode or that decoded to unreadable glyph codes (requires Poppler for `pdf2image` and Tesseract for local OCR)
 4. **PDF tables** (opt-in on `TextExtractor`): with `extract_tables=True`, [pdfplumber](https://pypi.org/project/pdfplumber/) detects tables on each page; the library filters one-column text boxes, collapses split headers, merges continuation rows, and appends Markdown tables after that page’s text (or returns structured matrices via `extract_tables_from_pdf`)
 5. **Structured extraction** (parallel API): `StructuredExtractor` extracts item-oriented tables from PDF / XLSX / CSV / DOCX into matrices + quality scores, and can render MinerU-compatible `full.md` with HTML `<table>` blocks — **without changing** plain `TextExtractor` behaviour
 6. **Archive extraction**: Format handler → extract to temp → flatten with stable names (extensionless entries preserved) → optionally remove source. Misnamed archives (e.g. `.zip` that is a PDF) use **magic-byte fallbacks**
@@ -58,6 +58,7 @@ pip install goblintools
 - If your pypdf build exposes `MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH` on `pypdf.filters`, the library increases that limit slightly so very large but legitimate content streams can still be decoded; if the attribute is missing (some forks or versions), that step is skipped automatically.
 - For scanned PDFs or pages with no usable text layer, enable **`TextExtractor(ocr_handler=True)`** and install Poppler + Tesseract.
 - Table extraction targets **native (digital) PDFs** with a text layer and visible table structure. Scanned pages need OCR first; table detection from scans (Textract TABLES / img2table) is not wired yet.
+- **Broken font encoding (non-scanned PDFs)**: some PDFs use a font `/Encoding` with a `/Differences` array mapping character codes to non-standard glyph names, with no working `/ToUnicode` CMap. Neither pypdf nor pdfminer can recover real characters from that — the mapping genuinely isn't in the file, even though the PDF renders correctly in any viewer (rendering uses the embedded font program directly, not this metadata). The library detects the resulting garbage — pypdf's raw `/143`-style glyph-name tokens, pdfminer/pdfplumber's `(cid:143)` markers, or a per-glyph substitution where codes land on ASCII punctuation/digits instead of the real letters — and retries affected pages with pdfplumber, then with **`ocr_handler`** (page-level, not a full-document re-OCR) when configured. Without an `ocr_handler`, such pages are returned as-is (unreadable) with a warning logged; this cannot be fixed without OCR since the correct characters are not recoverable from the text layer.
 
 ---
 
@@ -622,6 +623,10 @@ The file format is not supported, or the file has no extension and content could
 
 Install system tools: `unrar` and `p7zip`. See [Archive Support](#archive-support).
 
+### Extracted PDF text is garbled — looks like `/143 /120 /108 ...` or `(cid:143)(cid:16)...`, or is readable-looking but not real words
+
+The PDF's font maps character codes to custom glyph names with no working `/ToUnicode` CMap, so pypdf/pdfminer can't recover real characters (see [Broken font encoding](#pdf-extraction-notes) above). The library detects this automatically and retries with pdfplumber then OCR — pass `ocr_handler=True` (and `use_aws=True` with credentials, or install Tesseract locally) so the fallback has somewhere to go. Without an OCR handler, these pages come back unreadable; there is no way to decode them from the text layer alone.
+
 ---
 
 ## Escopo e Limites
@@ -631,7 +636,12 @@ Install system tools: `unrar` and `p7zip`. See [Archive Support](#archive-suppor
 
 ---
 
-## Release highlights (0.8.0)
+## Release highlights (0.9.3)
+
+- **Broken font encoding detection**: PDFs whose font `/Encoding /Differences` maps to non-standard glyph names with no `/ToUnicode` CMap used to silently pass through as "successfully extracted" garbage (pypdf's raw `/143`-style tokens counted as meaningful text). New `_looks_like_encoded_glyphs` heuristic catches this — plus pdfminer's `(cid:143)` notation and a substitution-cipher variant (codes mapped into ASCII punctuation/digits, only detectable via overall letter density, since it has no fixed token shape) — and retries affected pages with pdfplumber, then per-page OCR when `ocr_handler` is configured.
+- **OCR fallback no longer gated on `has_images`**: the whole-document OCR fallback used to only trigger when pypdf found an `/Image` XObject on the page. Broken font encoding has nothing to do with embedded images (it affects native, non-scanned text), so the gate was dropped — OCR now triggers on any unreadable extraction result, image or not.
+
+### Earlier (0.8.0)
 
 - **StructuredExtractor**: New parallel API (`goblintools.structured`) for item-oriented tables from PDF, XLSX/XLSM, CSV, and DOCX. Renders MinerU-compatible HTML `<table>` `full.md` and exposes `ok_for_items` quality gate. Does **not** change `TextExtractor` defaults or plain-text output.
 - **Quality**: Footer/note row drop, light cell cleanup, itemish header detection (ITEM/DESCRIÇÃO/QTD), qty/value parse rates.

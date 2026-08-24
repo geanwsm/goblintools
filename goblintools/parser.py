@@ -1,6 +1,7 @@
 import csv
 import logging
 import os
+import re
 import unicodedata
 from typing import Callable, Dict, List, Optional, Set, Tuple
 from pathlib import Path
@@ -44,6 +45,73 @@ def _has_meaningful_text(text: str) -> bool:
         cat = unicodedata.category(ch)
         if cat[0] in ("L", "N", "P", "S", "M"):
             return True
+    return False
+
+
+_GLYPH_NAME_TOKEN_RE = re.compile(r"^/[A-Za-z]{0,4}\d{1,5}$")
+_CID_TOKEN_RE = re.compile(r"\(cid:\d+\)")
+
+
+def _letter_ratio(text: str) -> float:
+    """Fraction of non-whitespace characters in *text* that are letters (any script)."""
+    non_space = [c for c in text if not c.isspace()]
+    if not non_space:
+        return 0.0
+    return sum(1 for c in non_space if c.isalpha()) / len(non_space)
+
+
+def _looks_like_encoded_glyphs(
+    text: str,
+    *,
+    min_tokens: int = 8,
+    ratio_threshold: float = 0.4,
+    min_len: int = 40,
+    cid_char_ratio_threshold: float = 0.3,
+    min_letter_ratio: float = 0.3,
+) -> bool:
+    """True if *text* looks like an undecoded/garbled PDF text layer rather than
+    real extracted content.
+
+    Covers three concrete failure modes seen in practice, all stemming from the
+    same root cause — a font ``/Encoding`` with a ``/Differences`` array mapping
+    character codes to non-standard glyph names, combined with no working
+    ``/ToUnicode`` CMap, so no text-layer library can recover the real characters
+    (the mapping information genuinely is not in the file; the PDF still renders
+    correctly in any viewer because rendering uses the embedded font program
+    directly, not this code-to-Unicode mapping):
+
+    1. pypdf-style raw glyph-name tokens (``/143``, ``/j0``) — pypdf falls back to
+       emitting the PDF name object itself when it can't resolve it.
+    2. pdfminer/pdfplumber-style CID markers (``(cid:143)``) — same fallback, pdfminer's
+       own notation.
+    3. Byte-substitution garbage: some pdfminer fallback paths map each character
+       code into some other single ASCII punctuation/digit character instead of
+       raising, producing a per-glyph substitution cipher that still *looks*
+       word-shaped (correct spacing) because only the space glyph happens to
+       resolve correctly — no simple constant shift recovers it. Neither pattern
+       above catches this, so it needs a general, format-agnostic signal: real
+       prose in any language is dominated by letters even in fairly numeric
+       documents (headers, labels, connecting words); text this ``[A-Za-z]``-poor
+       relative to its digit/punctuation content is not real language.
+
+    All three still count as "meaningful" for :func:`_has_meaningful_text`
+    (digits/slashes/parens are letters, numbers or punctuation), so they pass
+    through silently otherwise — and none of this is detectable via the presence
+    of images (unlike a scanned/image-only page).
+    """
+    tokens = text.split()
+    if len(tokens) >= min_tokens:
+        glyph_like = sum(1 for t in tokens if _GLYPH_NAME_TOKEN_RE.match(t))
+        if (glyph_like / len(tokens)) >= ratio_threshold:
+            return True
+
+    if len(text) >= min_len:
+        cid_chars = sum(len(m) for m in _CID_TOKEN_RE.findall(text))
+        if cid_chars and (cid_chars / len(text)) >= cid_char_ratio_threshold:
+            return True
+        if _letter_ratio(text) < min_letter_ratio:
+            return True
+
     return False
 
 
@@ -291,6 +359,94 @@ class TextExtractor:
                 pass
         return texts, failed, has_images
 
+    def _pdfplumber_page_text(self, pdf_path: str, indices: List[int]) -> Dict[int, str]:
+        """Best-effort text for specific 0-based pages via pdfplumber.
+
+        Tried as a cheaper alternative to OCR when pypdf's font/``/Differences``
+        resolution fails (see :func:`_looks_like_encoded_glyphs`): pdfplumber
+        (pdfminer.six) has independent font-handling code that sometimes succeeds
+        where pypdf's does not, and it's already a goblintools dependency (used for
+        table extraction), so trying it first costs nothing extra to install.
+        """
+        out: Dict[int, str] = {}
+        try:
+            import pdfplumber
+        except ImportError:
+            return out
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                for idx in indices:
+                    if idx < 0 or idx >= len(pdf.pages):
+                        continue
+                    try:
+                        out[idx] = pdf.pages[idx].extract_text() or ""
+                    except Exception as e:
+                        log_warning(
+                            logger, f"pdfplumber failed on page {idx} of {pdf_path}: {e}"
+                        )
+        except Exception as e:
+            log_warning(logger, f"pdfplumber failed to open {pdf_path}: {e}")
+        return out
+
+    def _recover_glyph_garbage_pages(
+        self, file_path: str, page_texts: List[str], skip_indices: Set[int]
+    ) -> List[str]:
+        """Replace pages whose pypdf text looks like raw glyph names.
+
+        Tries pdfplumber first (cheap, already a dependency); pages it can't fix
+        fall through to OCR (via ``self.ocr_handler``) if one was configured.
+        Pages in *skip_indices* (already handled as pypdf-read failures) are left
+        alone. Mutates and returns *page_texts*.
+        """
+        garbage_pages = {
+            i
+            for i, t in enumerate(page_texts)
+            if i not in skip_indices and _looks_like_encoded_glyphs(t)
+        }
+        if not garbage_pages:
+            return page_texts
+
+        log_warning(
+            logger,
+            f"{len(garbage_pages)} page(s) of {file_path} look like raw PDF glyph "
+            "names (broken font /Differences encoding with no /ToUnicode); "
+            "trying pdfplumber.",
+        )
+        plumber_texts = self._pdfplumber_page_text(file_path, sorted(garbage_pages))
+        still_garbage: Set[int] = set()
+        for idx in garbage_pages:
+            candidate = plumber_texts.get(idx, "")
+            if (
+                candidate
+                and _has_meaningful_text(candidate)
+                and not _looks_like_encoded_glyphs(candidate)
+            ):
+                page_texts[idx] = candidate
+            else:
+                still_garbage.add(idx)
+
+        if still_garbage and self.ocr_handler:
+            logger.info(
+                "OCR fallback for %d page(s) of %s (pypdf and pdfplumber both "
+                "produced unreadable glyph-code text)",
+                len(still_garbage),
+                file_path,
+            )
+            ocr_by_page = self.ocr_handler.extract_text_from_pdf_page_indices(
+                file_path, sorted(still_garbage)
+            )
+            for idx in still_garbage:
+                if idx in ocr_by_page and ocr_by_page[idx]:
+                    page_texts[idx] = ocr_by_page[idx]
+        elif still_garbage:
+            log_warning(
+                logger,
+                f"{len(still_garbage)} page(s) of {file_path} still look like "
+                "glyph-code garbage after pdfplumber, but no OCR handler was provided.",
+            )
+
+        return page_texts
+
     def _merge_page_texts(
         self, primary: List[str], secondary: List[str]
     ) -> Tuple[List[str], Set[int]]:
@@ -390,6 +546,8 @@ class TextExtractor:
                     if idx in ocr_by_page and ocr_by_page[idx]:
                         page_texts[idx] = ocr_by_page[idx]
 
+            page_texts = self._recover_glyph_garbage_pages(file_path, page_texts, failed)
+
             if self.extract_tables and page_texts:
                 page_texts = self._merge_tables_into_page_texts(file_path, page_texts)
 
@@ -405,7 +563,15 @@ class TextExtractor:
                 except OSError:
                     pass
 
-        if not _has_meaningful_text(extracted_text) and has_images:
+        # Whole-document safety net: catches pages that individually stayed under
+        # _looks_like_encoded_glyphs's per-page ratio threshold but still add up to
+        # unreadable output overall, plus the pre-existing blank/corrupt-page case.
+        # Not gated on has_images: OCR rasterizes the page regardless of whether
+        # pypdf found an /Image XObject, and a broken font /Differences encoding
+        # (this function's main target) has nothing to do with embedded images.
+        if not _has_meaningful_text(extracted_text) or _looks_like_encoded_glyphs(
+            extracted_text
+        ):
             if self.ocr_handler:
                 logger.info(f"OCR required for file: {file_path}")
                 return self.ocr_handler.extract_text_from_pdf(file_path)
