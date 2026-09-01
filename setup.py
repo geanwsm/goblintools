@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="goblintools",
-    version="0.9.3",
+    version="0.10.0",
     packages=find_packages(exclude=["tests", "tests.*"]),
     install_requires=[
         "patool",
@@ -31,5 +31,6 @@ setup(
     author_email="gean@webgoal.com.br",
     description="Toolkit for archive extraction, OCR parsing, and file text extraction",
     license="MIT",
+    package_data={"goblintools": ["data/*.txt.gz", "data/*.LICENSE"]},
     include_package_data=True,
 )

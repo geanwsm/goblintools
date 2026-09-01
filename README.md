@@ -13,23 +13,26 @@ GoblinTools provides a unified toolkit for extracting text from documents (PDF, 
 
 ```
 goblintools/
-├── parser.py             # TextExtractor - main extraction, format parsers
+├── parser.py             # TextExtractor - main extraction, format parsers, broken-text-layer recovery
 ├── table_extractor.py    # PDF table detection (pdfplumber), Markdown, quality filters
 ├── structured/           # Parallel StructuredExtractor (HTML tables + quality gate)
 ├── pypdf_workarounds.py  # PyPDF monkey-patches (indirect font metrics, optional stream cap)
+├── ptbr_words.py         # Embedded PT-BR wordlist helpers (broken-text-layer corroboration)
+├── extraction_report.py  # ExtractionReport / PageExtraction - per-page extraction provenance
 ├── file_handling.py      # FileManager, ArchiveHandler, FileValidator
 ├── text_cleaner.py       # TextCleaner - clean_text, remove_text_noise, stopwords
 ├── config.py             # GoblinConfig, OCRConfig
 ├── log_policy.py         # configure() - library warning verbosity
 ├── ocr_parser.py         # OCRProcessor - Tesseract / AWS Textract
-└── retry.py              # retry_with_backoff utility
+├── retry.py              # retry_with_backoff utility
+└── data/                 # palavras.txt.gz (PT-BR wordlist, MPL-2.0) + its LICENSE
 ```
 
 ### Processing Flow
 
 1. **Text extraction**: File → parser by extension; if unknown or **no extension**, magic-byte sniffing (PDF, RTF, Office Open XML) → extracted text (with `file_path_pwd` tag)
 2. **Folder extraction**: Each file’s tag uses the **path relative to the folder** (as inside a zip), e.g. `edital/arquivo.pdf` not the full filesystem path
-3. **PDF text**: [pypdf](https://pypi.org/project/pypdf/) (≥ 6.15.0) with built-in workarounds for common producer bugs (e.g. font widths as indirect references). The reader tries the file as-is, merges text from an internal resave when some pages fail, then uses plain and layout extraction modes. Pages whose text turns out to be an **undecoded font encoding** (glyph-code garbage — see below) are retried with pdfplumber, then handed to OCR per page. **Optional OCR** (`ocr_handler=True`): full-document OCR when the PDF has images but almost no text, or **per-page OCR** for pages PyPDF still cannot decode or that decoded to unreadable glyph codes (requires Poppler for `pdf2image` and Tesseract for local OCR)
+3. **PDF text**: [pypdf](https://pypi.org/project/pypdf/) (≥ 6.15.0) with built-in workarounds for common producer bugs (e.g. font widths as indirect references). The reader tries the file as-is, merges text from an internal resave when some pages fail, then uses plain and layout extraction modes. Pages whose text turns out to be a **broken text layer** — glyph-code garbage *or* a per-glyph substitution cipher that still looks word-shaped (see below) — are retried with **pdfplumber → poppler `pdftotext` → per-page OCR**. A per-call `TextExtractor.last_extraction_report` records what happened to each page. **Optional OCR** (`ocr_handler=True`): full-document OCR when the PDF has images but almost no text or the whole text layer is a cipher, or **per-page OCR** for pages the text engines cannot decode (requires Poppler for `pdf2image` and Tesseract for local OCR)
 4. **PDF tables** (opt-in on `TextExtractor`): with `extract_tables=True`, [pdfplumber](https://pypi.org/project/pdfplumber/) detects tables on each page; the library filters one-column text boxes, collapses split headers, merges continuation rows, and appends Markdown tables after that page’s text (or returns structured matrices via `extract_tables_from_pdf`)
 5. **Structured extraction** (parallel API): `StructuredExtractor` extracts item-oriented tables from PDF / XLSX / CSV / DOCX into matrices + quality scores, and can render MinerU-compatible `full.md` with HTML `<table>` blocks — **without changing** plain `TextExtractor` behaviour
 6. **Archive extraction**: Format handler → extract to temp → flatten with stable names (extensionless entries preserved) → optionally remove source. Misnamed archives (e.g. `.zip` that is a PDF) use **magic-byte fallbacks**
@@ -46,11 +49,12 @@ pip install goblintools
 
 - **Python**: 3.9 or newer
 - **pypdf**: 6.15.0 or newer (declared in package metadata; used for PDF text extraction)
-- **pdfplumber**: Used for optional PDF table detection (`extract_tables=True` / `extract_tables_from_pdf`)
+- **pdfplumber**: Used for optional PDF table detection (`extract_tables=True` / `extract_tables_from_pdf`) and as a recovery engine for broken text layers
 - **Tesseract OCR**: Required for local OCR support ([Installation Guide](https://github.com/tesseract-ocr/tesseract))
   - **Portuguese Language Pack**: Install `tesseract-ocr-por` for Portuguese text recognition
-- **Poppler**: Required when using OCR on PDFs (`pdf2image`); install `poppler-utils` (Debian/Ubuntu) or your OS equivalent
+- **Poppler**: Used by `pdf2image` (OCR) **and** by the `pdftotext` recovery step for broken text layers; install `poppler-utils` (Debian/Ubuntu) or your OS equivalent. If `pdftotext` is not on `PATH`, that recovery step is skipped with a warning.
 - **AWS Credentials**: Required for AWS Textract cloud OCR
+- **Embedded PT-BR wordlist**: `goblintools/data/palavras.txt.gz` (≈ 265k words) ships with the package and is used only to corroborate broken-text-layer detection. It is derived from [pythonprobr/palavras](https://github.com/pythonprobr/palavras) and distributed under the **MPL-2.0** (see `goblintools/data/palavras.LICENSE`); the rest of goblintools stays MIT.
 
 ### PDF extraction notes
 
@@ -58,7 +62,14 @@ pip install goblintools
 - If your pypdf build exposes `MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH` on `pypdf.filters`, the library increases that limit slightly so very large but legitimate content streams can still be decoded; if the attribute is missing (some forks or versions), that step is skipped automatically.
 - For scanned PDFs or pages with no usable text layer, enable **`TextExtractor(ocr_handler=True)`** and install Poppler + Tesseract.
 - Table extraction targets **native (digital) PDFs** with a text layer and visible table structure. Scanned pages need OCR first; table detection from scans (Textract TABLES / img2table) is not wired yet.
-- **Broken font encoding (non-scanned PDFs)**: some PDFs use a font `/Encoding` with a `/Differences` array mapping character codes to non-standard glyph names, with no working `/ToUnicode` CMap. Neither pypdf nor pdfminer can recover real characters from that — the mapping genuinely isn't in the file, even though the PDF renders correctly in any viewer (rendering uses the embedded font program directly, not this metadata). The library detects the resulting garbage — pypdf's raw `/143`-style glyph-name tokens, pdfminer/pdfplumber's `(cid:143)` markers, or a per-glyph substitution where codes land on ASCII punctuation/digits instead of the real letters — and retries affected pages with pdfplumber, then with **`ocr_handler`** (page-level, not a full-document re-OCR) when configured. Without an `ocr_handler`, such pages are returned as-is (unreadable) with a warning logged; this cannot be fixed without OCR since the correct characters are not recoverable from the text layer.
+- **Broken font encoding (non-scanned PDFs)**: some PDFs use a font `/Encoding` with a `/Differences` array mapping character codes to non-standard glyph names, with no working `/ToUnicode` CMap. Neither pypdf nor pdfminer can recover real characters from that — the mapping genuinely isn't in the file, even though the PDF renders correctly in any viewer (rendering uses the embedded font program directly, not this metadata). The library detects the resulting garbage in three ways:
+  - pypdf's raw `/143`-style glyph-name tokens and pdfminer/pdfplumber's `(cid:143)` markers;
+  - a per-glyph substitution where codes land on ASCII punctuation/digits (low letter ratio);
+  - a **per-glyph substitution cipher** that keeps word shape and letter/digit categories (e.g. `couvocnrónto`, `LICITAgAO`, `CaberÆ`, `R$ í47.200,04`) — flagged by the per-window rate of cipher-shaped tokens (a mid-word lowercase→UPPERCASE transition that is not two real words glued together), corroborated by a low PT-BR dictionary hit-rate. Clean prose editais sit at ~0; this class used to pass silently as "valid text". Heuristic — heavily tabular budgets and documents whose extracted text contains large non-prose sections (ad-tracking blobs, embedded XML, space-stripped tables) can also trip it; those are reported as low-confidence rather than silently trusted.
+
+  Affected pages are retried with **pdfplumber → poppler `pdftotext`**, and **per-page OCR** only when the corruption is severe (page cipher rate well past the threshold, or unambiguous `/143`/`(cid:N)` garbage) so a false positive on a table page is not re-OCR'd. Whatever the outcome, `extract_from_file` still returns the best text it has (partially-readable content is not lost) and never replaces good text with an inferior engine's output; the result is summarised on `TextExtractor.last_extraction_report` (see below). Without an `ocr_handler`, unrecoverable pages come back as-is with a `text-layer confidence` warning logged.
+- **`TextExtractor.last_extraction_report`**: after each `extract_from_file` on a **PDF**, this holds an `ExtractionReport` — `overall_status` is `clean` / `partially_recovered` / `corrupt_unrecoverable`, and `pages` lists the per-page `status` and the `engine` that produced each page (`pypdf` / `pdfplumber` / `poppler` / `ocr`). It is `None` before the first call and for non-PDF inputs, and reflects **only the last call** — do not share one `TextExtractor` across threads if you rely on it. Downstream consumers should treat a non-`clean` status as "do not trust extracted numbers" (write `null` / needs-review rather than a confident `0`).
+- **`TextExtractor.last_extraction_reports`**: after `extract_from_folder`, a `dict` mapping each processed **PDF**'s relative path (same string as its `file_path_pwd` tag) to its `ExtractionReport`. Use this instead of `last_extraction_report` when processing a folder, since the single-value attribute would only reflect the last file.
 
 ---
 
@@ -499,8 +510,9 @@ Import from the package: `from goblintools import configure` (or `import goblint
 
 ### TextExtractor
 - `__init__(ocr_handler=False, use_aws=False, aws_access_key=None, aws_secret_key=None, aws_region='us-east-1', config=None, suppress_warnings=None, extract_tables=False, table_format='markdown')` - `suppress_warnings`: if `True`/`False`, updates library warning policy; if `None`, leaves current setting (e.g. from `configure()`). `extract_tables`: when `True`, detect PDF tables with pdfplumber and embed them in the text. `table_format`: currently only `"markdown"`
-- `extract_from_file(file_path, display_path=None)` - Extract text from single file. Returns `str` with `file_path_pwd` tag; optional `display_path` overrides the tag path
-- `extract_from_folder(folder_path)` - Extract text from all files in folder (recursively). Tags use **paths relative to** `folder_path`
+- `extract_from_file(file_path, display_path=None)` - Extract text from single file. Returns `str` with `file_path_pwd` tag; optional `display_path` overrides the tag path. For PDFs, populates `last_extraction_report`
+- `extract_from_folder(folder_path)` - Extract text from all files in folder (recursively). Tags use **paths relative to** `folder_path`. Populates `last_extraction_reports` (dict keyed by relative path) for PDFs
+- `last_extraction_report` / `last_extraction_reports` - `ExtractionReport` provenance for the last PDF (`extract_from_file`) / all PDFs of the last folder run (`extract_from_folder`)
 - `extract_tables_from_pdf(file_path, max_pages=None)` - Return a list of `{"page", "index", "rows"}` from a PDF (does not require `extract_tables=True` on the constructor)
 - `pdf_needs_ocr(pdf_path)` - Check if PDF requires OCR processing
 - `add_parser(extension, parser_func)` - Add custom parser for file extension
@@ -625,20 +637,27 @@ Install system tools: `unrar` and `p7zip`. See [Archive Support](#archive-suppor
 
 ### Extracted PDF text is garbled — looks like `/143 /120 /108 ...` or `(cid:143)(cid:16)...`, or is readable-looking but not real words
 
-The PDF's font maps character codes to custom glyph names with no working `/ToUnicode` CMap, so pypdf/pdfminer can't recover real characters (see [Broken font encoding](#pdf-extraction-notes) above). The library detects this automatically and retries with pdfplumber then OCR — pass `ocr_handler=True` (and `use_aws=True` with credentials, or install Tesseract locally) so the fallback has somewhere to go. Without an OCR handler, these pages come back unreadable; there is no way to decode them from the text layer alone.
+The PDF's font maps character codes to custom glyph names with no working `/ToUnicode` CMap, so pypdf/pdfminer can't recover real characters (see [Broken font encoding](#pdf-extraction-notes) above). This includes the subtle case where the output *keeps word shape* (`couvocnrónto`, `R$ í47.200,04`) — the library now flags it via the rate of internal lowercase→UPPERCASE transitions plus a PT-BR dictionary check. It retries with **pdfplumber → poppler `pdftotext` → OCR** — pass `ocr_handler=True` (and `use_aws=True` with credentials, or install Tesseract + `tesseract-ocr-por` locally) so the fallback has somewhere to go. Without an OCR handler these pages come back unreadable; check `extractor.last_extraction_report.overall_status` (`corrupt_unrecoverable` / `partially_recovered`) and treat non-`clean` results as untrusted. There is no way to decode them from the text layer alone.
 
 ---
 
 ## Escopo e Limites
 
-- **In scope**: Text extraction from documents, spreadsheets, presentations; optional native-PDF table extraction (pdfplumber → Markdown / row matrices); parallel `StructuredExtractor` (PDF/XLSX/CSV/DOCX → HTML `full.md` + quality); archive handling; OCR (Tesseract, AWS Textract); text cleaning (Portuguese-focused); file operations.
-- **Out of scope**: Real-time streaming, document conversion to other formats, indexing/search, web scraping. OCR requires Tesseract (local) or AWS credentials (cloud). Table extraction from pure scans (Textract TABLES / img2table) is not included yet.
+- **In scope**: Text extraction from documents, spreadsheets, presentations; optional native-PDF table extraction (pdfplumber → Markdown / row matrices); parallel `StructuredExtractor` (PDF/XLSX/CSV/DOCX → HTML `full.md` + quality); broken-text-layer detection + recovery (pdfplumber → poppler → OCR) with a per-call `ExtractionReport`; archive handling; OCR (Tesseract, AWS Textract); text cleaning (Portuguese-focused); file operations.
+- **Out of scope**: Real-time streaming, document conversion to other formats, indexing/search, web scraping. OCR requires Tesseract (local) or AWS credentials (cloud). Table extraction from pure scans (Textract TABLES / img2table) is not included yet. Acting on `last_extraction_report` (e.g. writing `null` instead of a wrong value) is the consumer's responsibility.
 
 ---
 
-## Release highlights (0.9.3)
+## Release highlights (0.10.0)
 
-- **Broken font encoding detection**: PDFs whose font `/Encoding /Differences` maps to non-standard glyph names with no `/ToUnicode` CMap used to silently pass through as "successfully extracted" garbage (pypdf's raw `/143`-style tokens counted as meaningful text). New `_looks_like_encoded_glyphs` heuristic catches this — plus pdfminer's `(cid:143)` notation and a substitution-cipher variant (codes mapped into ASCII punctuation/digits, only detectable via overall letter density, since it has no fixed token shape) — and retries affected pages with pdfplumber, then per-page OCR when `ocr_handler` is configured.
+- **Per-glyph substitution cipher detection**: a broken font `/Differences` map can produce text that keeps word shape and letter/digit categories (`EÍesentadas`, `couvocnrónto`, `R$ í47.200,04`, `Lei nº 14.í33`) — so `_has_meaningful_text` and `_looks_like_encoded_glyphs` both passed and the garbage was indexed as valid. New `_looks_like_substitution_cipher` flags it via the sliding-window rate of internal lowercase→UPPERCASE transitions (a 119-doc clean corpus peaked at 0.0025; corrupted docs run 0.05–0.28), corroborated by a low hit-rate against an **embedded PT-BR wordlist** (`goblintools/data/palavras.txt.gz`, MPL-2.0).
+- **Recovery chain gains poppler**: broken pages are now retried **pdfplumber → poppler `pdftotext` → per-page OCR** (poppler via the `pdftotext` binary — no new Python build dependency; skipped with a warning if absent).
+- **`TextExtractor.last_extraction_report`** (single file) / **`last_extraction_reports`** (dict, after `extract_from_folder`): an `ExtractionReport` records `overall_status` (`clean` / `partially_recovered` / `corrupt_unrecoverable`) and per-page `status` + `engine`. `extract_from_file` still returns `str` and its output for clean PDFs is unchanged; downstream consumers can now distinguish "trustworthy text" from "recovered / still corrupt" instead of silently storing wrong numbers.
+- **Whole-document safety net** also triggers on a whole-document substitution cipher (previously only blank text or `/143`/`(cid:N)` garbage).
+
+### Earlier (0.9.3)
+
+- **Broken font encoding detection**: PDFs whose font `/Encoding /Differences` maps to non-standard glyph names with no `/ToUnicode` CMap used to silently pass through as "successfully extracted" garbage (pypdf's raw `/143`-style tokens counted as meaningful text). `_looks_like_encoded_glyphs` heuristic catches this — plus pdfminer's `(cid:143)` notation and a substitution-cipher variant (codes mapped into ASCII punctuation/digits, detectable via overall letter density) — and retries affected pages with pdfplumber, then per-page OCR when `ocr_handler` is configured.
 - **OCR fallback no longer gated on `has_images`**: the whole-document OCR fallback used to only trigger when pypdf found an `/Image` XObject on the page. Broken font encoding has nothing to do with embedded images (it affects native, non-scanned text), so the gate was dropped — OCR now triggers on any unreadable extraction result, image or not.
 
 ### Earlier (0.8.0)

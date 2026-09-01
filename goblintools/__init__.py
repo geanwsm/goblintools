@@ -11,6 +11,7 @@ from .table_extractor import (
     normalize_table_rows,
 )
 from .structured import StructuredDocument, StructuredExtractor
+from .extraction_report import ExtractionReport, PageExtraction
 
 __all__ = [
     'FileValidator', 'ArchiveHandler', 'FileManager',
@@ -18,5 +19,6 @@ __all__ = [
     'configure', 'extract_pdf_tables', 'table_to_markdown',
     'is_meaningful_table', 'normalize_table_rows',
     'StructuredExtractor', 'StructuredDocument',
+    'ExtractionReport', 'PageExtraction',
 ]
-__version__ = '0.9.3'
+__version__ = '0.10.0'

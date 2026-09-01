@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "goblintools"
-version = "0.9.3"
+version = "0.10.0"
 description = "Toolkit for archive extraction, OCR parsing, and file text extraction"
 authors = [{ name="Gean Matos", email="gean@webgoal.com.br" }]
 readme = "README.md"
@@ -42,3 +42,6 @@ Repository = "https://github.com/geanatelie/goblintools.git"
 [tool.setuptools.packages.find]
 include = ["goblintools*"]
 exclude = ["tests*"]
+
+[tool.setuptools.package-data]
+goblintools = ["data/*.txt.gz", "data/*.LICENSE"]

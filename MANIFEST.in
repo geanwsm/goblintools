@@ -1,0 +1,1 @@
+recursive-include goblintools/data *.txt.gz *.LICENSE

@@ -26,12 +26,23 @@ env/
 # Package files
 *.jar
 
+# Archives
+*.zip
+*.rar
+*.7z
+*.tar
+*.tar.gz
+*.tgz
+
 # Maven
 target/
 dist/
 
 # JetBrains IDE
 .idea/
+
+# Darkside plugin working files
+.darkside/
 
 # Unit test reports
 TEST*.xml
