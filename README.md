@@ -648,6 +648,10 @@ The PDF's font maps character codes to custom glyph names with no working `/ToUn
 
 ---
 
+## Release highlights (0.10.1)
+
+- **Fewer substitution-cipher false positives**: engineering / Petrobras tenders tripped the heuristic on CamelCase alloy codes (`ENiCrFe`, `ERNiCrMo`) and on repeated jargon / brand names (`AltoQi`) in BOQ reference columns. The detector now (a) excludes `E`/`ER`-prefixed alloy designations, and (b) skips any sliding window whose "cipher-shaped" tokens are dominated by a few verbatim repeats — a real per-glyph cipher never emits the same token twice. Production flag rate on random editais dropped from ~3% to ~1%, with clean-prose editais still at ~0 and every known-corrupt document still detected.
+
 ## Release highlights (0.10.0)
 
 - **Per-glyph substitution cipher detection**: a broken font `/Differences` map can produce text that keeps word shape and letter/digit categories (`EÍesentadas`, `couvocnrónto`, `R$ í47.200,04`, `Lei nº 14.í33`) — so `_has_meaningful_text` and `_looks_like_encoded_glyphs` both passed and the garbage was indexed as valid. New `_looks_like_substitution_cipher` flags it via the sliding-window rate of internal lowercase→UPPERCASE transitions (a 119-doc clean corpus peaked at 0.0025; corrupted docs run 0.05–0.28), corroborated by a low hit-rate against an **embedded PT-BR wordlist** (`goblintools/data/palavras.txt.gz`, MPL-2.0).

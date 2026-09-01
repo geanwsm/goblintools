@@ -394,6 +394,33 @@ def test_is_cipher_token():
     assert not _is_cipher_token("kgChapa")
 
 
+def test_is_cipher_token_excludes_alloy_codes():
+    """AWS/ASME welding filler-metal codes (common in engineering tenders) are
+    CamelCase but not corruption."""
+    for code in ("ENiCrFe", "ERNiCrMo", "ENiCrCoMo", "ERNiCrCoMo", "ENiCu"):
+        assert not _is_cipher_token(code)
+
+
+def test_substitution_cipher_ignores_repeated_jargon():
+    """A window whose 'cipher-shaped' tokens are one identifier repeated verbatim
+    (a per-glyph cipher never repeats a token) is not flagged."""
+    text = ("Tabela de Referencia Categoria Codigo Descricao Item Quantidade "
+            "Unidade Observacao AltoQi " * 30)
+    assert _looks_like_substitution_cipher(text) is False
+    assert _substitution_cipher_score(text) == 0.0
+
+
+def test_substitution_cipher_engineering_welding_spec_not_flagged():
+    """Real Petrobras welding spec: alloy codes + English process names, no cipher."""
+    text = (
+        "A soldagem de revestimento pelo processo FCAW com protecao gasosa e "
+        "permitida somente com aprovacao previa. Os consumiveis ENiCrFe ERNiCrMo "
+        "ENiCrCoMo ERNiFeCr e ENiMo devem atender a norma aplicavel. O gas de "
+        "protecao no processo GMAW deve ser argonio puro ou argonio com CO2. "
+    ) * 12
+    assert _looks_like_substitution_cipher(text) is False
+
+
 def test_substitution_cipher_flags_corrupted_edital():
     """anexo_1 of bidding 19317659: a 40-page edital whose font /Differences map is
     broken with no /ToUnicode. Text keeps word shape so the old detector missed it."""

@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import unicodedata
+from collections import Counter
 from typing import Callable, Dict, List, Optional, Set, Tuple
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -135,6 +136,12 @@ _SUBST_CIPHER_MIDCAP_SOFT = 0.035   # soft band needs the dict to also be poor
 _SUBST_CIPHER_MIDCAP_STRONG = 0.10  # bar to spend OCR / whole-document re-OCR
 _SUBST_CIPHER_DICT_HARD = 0.72      # window this Portuguese-dense is not a cipher
 _SUBST_CIPHER_DICT_SOFT = 0.55
+# A per-glyph cipher never emits the same token twice (each occurrence gets
+# different wrong glyphs). A window whose cipher-shaped tokens are dominated by a
+# few verbatim repeats is repeated jargon / brand names / table headers
+# (``AltoQi``, ``ArcWelding``, ``nomeSancionad``), not corruption — skip it.
+_SUBST_CIPHER_MIN_DISTINCT_RATIO = 0.30
+_SUBST_CIPHER_MAX_TOKEN_SHARE = 0.40
 
 # Guard against swapping a page's text for an equivalent one on a false-positive
 # detection: a recovery candidate must beat the original's PT-BR dictionary rate by
@@ -151,18 +158,25 @@ def _tokenize_words(text: str) -> List[str]:
     return _WORD_TOKEN_RE.findall(text)
 
 
+# AWS/ASME welding filler-metal classifications and similar alloy codes:
+# ``E``/``ER`` followed by run-together element symbols (``ENiCrFe``, ``ERNiCrMo``,
+# ``ENiCrCoMo``). Common in engineering / Petrobras tenders; not corruption.
+_ALLOY_CODE_RE = re.compile(r"^ER?(?:[A-Z][a-z]?){2,}[0-9-]*$")
+
+
 def _is_cipher_token(token: str) -> bool:
     """True if *token* carries a mid-word lowercase->UPPERCASE transition that is
-    not just two real words glued together.
+    not just two real words glued together or a technical code.
 
     Real Portuguese tokens are lowercase, Capitalized (one leading cap) or ALL-CAPS.
     A per-glyph substitution cipher breaks that (``soQdaJHP``, ``LICITAgAO``,
-    ``idenAﬁcadas``). Table extraction that drops the space between a unit column
-    and a description (``unRolo``, ``kgChapa``) also produces the transition, so a
-    token that splits at the first such point into ``<prefix><real word>`` is
-    excluded — that is a layout artifact, not corruption.
+    ``idenAﬁcadas``). Excluded: unit columns glued to a description (``unRolo``,
+    ``kgChapa`` — split into ``<prefix><real word>``) and CamelCase alloy codes
+    (``ENiCrFe``, ``ERNiCrMo``) — both are layout / nomenclature, not corruption.
     """
     if len(token) < 4:
+        return False
+    if _ALLOY_CODE_RE.match(token):
         return False
     idx = next(
         (i for i in range(2, len(token)) if token[i].isupper() and token[i - 1].islower()),
@@ -176,6 +190,30 @@ def _is_cipher_token(token: str) -> bool:
     return True
 
 
+def _cipher_windows(text, window, step, min_tokens):
+    """Yield ``(cipher_token_rate, window_tokens)`` for each sliding window, skipping
+    windows with no cipher-shaped tokens and windows whose cipher tokens are
+    repetition-dominated (jargon, not corruption — see
+    ``_SUBST_CIPHER_MIN_DISTINCT_RATIO``)."""
+    tokens = _tokenize_words(text)
+    n = len(tokens)
+    if n < min_tokens:
+        return
+    is_cipher = [_is_cipher_token(t) for t in tokens]
+    for i in range(0, max(1, n - window + 1), step):
+        seg_tok = tokens[i : i + window]
+        seg_flag = is_cipher[i : i + window]
+        cipher_toks = [t for t, f in zip(seg_tok, seg_flag) if f]
+        if not cipher_toks:
+            continue
+        counts = Counter(t.lower() for t in cipher_toks)
+        if len(counts) / len(cipher_toks) < _SUBST_CIPHER_MIN_DISTINCT_RATIO:
+            continue
+        if counts.most_common(1)[0][1] / len(cipher_toks) > _SUBST_CIPHER_MAX_TOKEN_SHARE:
+            continue
+        yield len(cipher_toks) / len(seg_tok), seg_tok
+
+
 def _substitution_cipher_score(
     text: str,
     *,
@@ -186,17 +224,10 @@ def _substitution_cipher_score(
     """Worst sliding-window fraction of word-tokens that look cipher-shaped
     (see :func:`_is_cipher_token`). 0.0 when there is not enough text to judge."""
     try:
-        tokens = _tokenize_words(text)
-        n = len(tokens)
-        if n < min_tokens:
-            return 0.0
-        flags = [1 if _is_cipher_token(t) else 0 for t in tokens]
-        worst = 0.0
-        for i in range(0, max(1, n - window + 1), step):
-            seg = flags[i : i + window]
-            if seg:
-                worst = max(worst, sum(seg) / len(seg))
-        return worst
+        return max(
+            (rate for rate, _ in _cipher_windows(text, window, step, min_tokens)),
+            default=0.0,
+        )
     except Exception:
         return 0.0
 
@@ -218,29 +249,22 @@ def _looks_like_substitution_cipher(
     keeps word shape and letter/digit categories (so :func:`_looks_like_encoded_glyphs`
     and :func:`_has_meaningful_text` both pass), but the words are not real
     (``EÍesentadas``, ``couvocnrónto``, ``LICITAgAO``). Signal: rate of cipher-shaped
-    tokens per sliding window (corruption is often per-page). A 119-doc clean-prose
+    tokens per sliding window (corruption is often per-page), ignoring windows whose
+    cipher tokens are just a few verbatim repeats (technical nomenclature like
+    ``ENiCrFe`` / ``ArcWelding``, repeated table headers). A 119-doc clean-prose
     corpus from production sits at ~0; a low PT-BR dictionary hit-rate in the same
     window corroborates the softer band. Heavily tabular budgets and web-scraped
     documents can still trip this — the recovery step guards against actually
     replacing good text (see :func:`_recovery_is_improvement`).
     """
     try:
-        tokens = _tokenize_words(text)
-        n = len(tokens)
-        if n < min_tokens:
-            return False
-        flags = [1 if _is_cipher_token(t) else 0 for t in tokens]
-        for i in range(0, max(1, n - window + 1), step):
-            seg = flags[i : i + window]
-            if not seg:
+        for rate, seg in _cipher_windows(text, window, step, min_tokens):
+            if rate < midcap_soft:
                 continue
-            midcap = sum(seg) / len(seg)
-            if midcap < midcap_soft:
-                continue
-            dr = dict_hit_rate(tokens[i : i + window])
-            if midcap >= midcap_hard and dr < dict_hard:
+            dr = dict_hit_rate(seg)
+            if rate >= midcap_hard and dr < dict_hard:
                 return True
-            if midcap_soft <= midcap < midcap_hard and dr < dict_soft:
+            if midcap_soft <= rate < midcap_hard and dr < dict_soft:
                 return True
         return False
     except Exception:
