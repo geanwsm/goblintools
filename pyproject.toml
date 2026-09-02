@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "goblintools"
-version = "0.10.1"
+version = "0.10.2"
 description = "Toolkit for archive extraction, OCR parsing, and file text extraction"
 authors = [{ name="Gean Matos", email="gean@webgoal.com.br" }]
 readme = "README.md"
