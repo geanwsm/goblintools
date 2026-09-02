@@ -59,3 +59,21 @@ class ExtractionReport:
             self.overall_status = OVERALL_CLEAN
         if any(p.engine == "ocr" for p in self.pages):
             self.used_ocr = True
+
+    def demote_to_clean_if_fully_ocr_recovered(self) -> bool:
+        """A fully scanned PDF that OCR re-read end to end is trustworthy, not
+        ``partially_recovered``. If every non-clean page ended ``RECOVERED`` via
+        ``ocr`` and none stayed ``CORRUPT_UNRECOVERABLE``, set ``overall_status``
+        back to :data:`OVERALL_CLEAN` (``used_ocr`` still records that OCR ran).
+        Returns ``True`` when the status was demoted."""
+        if self.overall_status == OVERALL_CLEAN:
+            return False
+        non_clean = [p for p in self.pages if p.status != CLEAN]
+        if not non_clean:
+            return False
+        if any(p.status == CORRUPT_UNRECOVERABLE for p in self.pages):
+            return False
+        if all(p.status == RECOVERED and p.engine == "ocr" for p in non_clean):
+            self.overall_status = OVERALL_CLEAN
+            return True
+        return False

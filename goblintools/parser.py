@@ -163,6 +163,116 @@ def _tokenize_words(text: str) -> List[str]:
 # ``ENiCrCoMo``). Common in engineering / Petrobras tenders; not corruption.
 _ALLOY_CODE_RE = re.compile(r"^ER?(?:[A-Z][a-z]?){2,}[0-9-]*$")
 
+# --- glued-words vs. substitution cipher ------------------------------------
+# A no-space PDF text extraction concatenates real words into one CamelCase token
+# (``NotadaPropostaFinanceira``, ``ModelodeProposta``, ``KitGNSScompostopor``);
+# a per-glyph cipher instead deforms individual short words (``coMPoslçAo``,
+# ``manHdo``). Both trip the mid-word case-transition test in :func:`_is_cipher_token`,
+# so the detector needs to tell them apart. The embedded PT-BR wordlist is missing
+# common forms (``proposta``, ``anexo``, ``financeira``), so this is structural, not
+# dictionary-based: glued text decomposes into word-shaped runs, a cipher does not.
+_DETECT_VOWELS = frozenset("aeiouyàáâãäåéêëíîïóôõöúûü")
+# two-letter clusters that can legitimately start a Portuguese word
+_PT_WORD_ONSETS = frozenset({
+    "bl", "br", "cl", "cr", "dr", "fl", "fr", "gl", "gr", "pl", "pr",
+    "tr", "vr", "ch", "lh", "nh", "ps", "gn", "mn",
+})
+_ROMAN_NUMERAL_RE = re.compile(
+    r"^(?=[MDCLXVI])M{0,3}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})$"
+)
+_ACRONYM_RE = re.compile(r"^[A-Z]{2,6}$")
+_LEADING_ACRONYM_RE = re.compile(r"^[A-Z]{2,6}(?=[a-zà-ÿ])")
+# URLs leave CamelCase path/query slugs (``/CertificadoAutenticidade?token=v6iHJuY``)
+# that look cipher-shaped; strip them before the detector tokenizes.
+_URL_RE = re.compile(r"https?://\S+|\bwww\.\S+", re.IGNORECASE)
+
+
+def _normalize_for_detection(text: str) -> str:
+    """NFKC-fold (``ﬁ``->``fi``, ``²``->``2``, ``º``->``o``) and drop URLs so the
+    substitution-cipher heuristic judges only real prose. Applied to the text the
+    detector inspects — never to the text :class:`TextExtractor` returns."""
+    return _URL_RE.sub(" ", unicodedata.normalize("NFKC", text))
+
+
+def _is_accented(ch: str) -> bool:
+    return any(unicodedata.combining(c) for c in unicodedata.normalize("NFD", ch))
+
+
+def _detect_vowel_ratio(s: str) -> float:
+    letters = [c for c in s if c.isalpha()]
+    if not letters:
+        return 0.0
+    return sum(c.lower() in _DETECT_VOWELS for c in letters) / len(letters)
+
+
+def _max_consonant_run(s: str) -> int:
+    run = longest = 0
+    for c in s:
+        if c.isalpha() and c.lower() not in _DETECT_VOWELS:
+            run += 1
+            longest = max(longest, run)
+        else:
+            run = 0
+    return longest
+
+
+def _case_segments(token: str) -> List[str]:
+    """Split *token* at every lowercase->UPPERCASE boundary (word-initial caps)."""
+    cuts = (
+        [0]
+        + [i for i in range(1, len(token))
+           if token[i].isupper() and token[i - 1].islower()]
+        + [len(token)]
+    )
+    return [token[a:b] for a, b in zip(cuts, cuts[1:])]
+
+
+def _plausible_word_start(core: str) -> bool:
+    if not core:
+        return False
+    if core[0].isupper() and _is_accented(core[0]):
+        return False  # ``Í`` / ``É`` / ``Á`` mid-token is a cipher glyph, not a word
+    if core[0].lower() in _DETECT_VOWELS:
+        return True
+    if len(core) >= 2 and core[1].lower() in _DETECT_VOWELS:
+        return True
+    return core[:2].lower() in _PT_WORD_ONSETS
+
+
+def _is_word_shaped_segment(seg: str) -> bool:
+    """True if *seg* could be one or more real Portuguese words glued together."""
+    core = _LEADING_ACRONYM_RE.sub("", seg, count=1)
+    return (
+        len(core) >= 4
+        and _plausible_word_start(core)
+        and _detect_vowel_ratio(core) >= 0.28
+        and _max_consonant_run(core) < 5
+    )
+
+
+def _looks_like_glued_words(token: str) -> bool:
+    """True if *token* is CamelCase-concatenated real words from a no-space text
+    extraction rather than a per-glyph substitution cipher. Wordlist-free: a cipher
+    deforms individual short words, while glued text decomposes into word-shaped runs
+    at the lowercase->UPPERCASE boundaries."""
+    token = unicodedata.normalize("NFKC", token)
+    if len(token) < 8:
+        return False
+    segs = _case_segments(token)
+    while segs and segs[-1].isupper() and _ROMAN_NUMERAL_RE.match(segs[-1]):
+        segs = segs[:-1]
+    if len(segs) < 2:
+        return False
+    good = sum(1 for s in segs if _is_word_shaped_segment(s))
+    if good >= 2:
+        return True
+    # one long real-word run plus an acronym (``bateriasparareceptorGNSS``)
+    return (
+        good >= 1
+        and any(_ACRONYM_RE.match(s) for s in segs)
+        and any(_is_word_shaped_segment(s) and len(s) >= 10 for s in segs)
+    )
+
 
 def _is_cipher_token(token: str) -> bool:
     """True if *token* carries a mid-word lowercase->UPPERCASE transition that is
@@ -195,11 +305,13 @@ def _cipher_windows(text, window, step, min_tokens):
     windows with no cipher-shaped tokens and windows whose cipher tokens are
     repetition-dominated (jargon, not corruption — see
     ``_SUBST_CIPHER_MIN_DISTINCT_RATIO``)."""
-    tokens = _tokenize_words(text)
+    tokens = _tokenize_words(_normalize_for_detection(text))
     n = len(tokens)
     if n < min_tokens:
         return
-    is_cipher = [_is_cipher_token(t) for t in tokens]
+    is_cipher = [
+        _is_cipher_token(t) and not _looks_like_glued_words(t) for t in tokens
+    ]
     for i in range(0, max(1, n - window + 1), step):
         seg_tok = tokens[i : i + window]
         seg_flag = is_cipher[i : i + window]
@@ -893,6 +1005,12 @@ class TextExtractor:
                         pe.status = RECOVERED
                         pe.engine = "ocr"
                 report.recompute_overall()
+                if report.demote_to_clean_if_fully_ocr_recovered():
+                    logger.info(
+                        "%s: scanned PDF re-read end to end via OCR (%d page(s))",
+                        file_path,
+                        len(report.pages),
+                    )
                 self.last_extraction_report = report
                 self._log_report_warning(report)
                 return ocr_text
@@ -906,6 +1024,12 @@ class TextExtractor:
                     pe.engine = ""
 
         report.recompute_overall()
+        if report.demote_to_clean_if_fully_ocr_recovered():
+            logger.info(
+                "%s: scanned PDF re-read end to end via OCR (%d page(s))",
+                file_path,
+                len(report.pages),
+            )
         self.last_extraction_report = report
         self._log_report_warning(report)
         return extracted_text

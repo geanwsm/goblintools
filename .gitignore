@@ -66,3 +66,7 @@ Thumbs.db
 *.mov
 *.wmv
 
+
+# Local-only diagnostics / scratch (never committed)
+.local/
+s3cache/

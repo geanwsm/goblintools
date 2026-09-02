@@ -15,7 +15,9 @@ from goblintools.parser import (
     _is_cipher_token,
     _letter_ratio,
     _looks_like_encoded_glyphs,
+    _looks_like_glued_words,
     _looks_like_substitution_cipher,
+    _normalize_for_detection,
     _substitution_cipher_score,
     _text_layer_looks_broken,
 )
@@ -401,6 +403,66 @@ def test_is_cipher_token_excludes_alloy_codes():
         assert not _is_cipher_token(code)
 
 
+def test_normalize_for_detection_folds_ligatures_and_strips_urls():
+    """The cipher detector inspects NFKC-folded, URL-free text."""
+    assert _normalize_for_detection("classiﬁcado") == "classificado"
+    assert _normalize_for_detection("2º item") == "2o item"
+    out = _normalize_for_detection("veja https://x.com/AbCdEf e www.y.com/Zz aqui")
+    assert "http" not in out and "www." not in out
+    assert out.split() == ["veja", "e", "aqui"]
+
+
+def test_looks_like_glued_words_true_for_no_space_extraction():
+    """A no-space PDF extraction concatenates real words into one CamelCase token."""
+    for glued in (
+        "TenhamcontrariadoaLegislaçãoetermosdopresente",
+        "InstruçõesNormativas",
+        "ModelodeProposta",
+        "NotadaPropostaFinanceira",
+        "MinutadoTermodeRegistrodePreços",
+        "JacquelinedeSouzaMonteiro",
+        "bateriasparareceptorGNSS",
+    ):
+        assert _looks_like_glued_words(glued) is True
+
+
+def test_looks_like_glued_words_false_for_cipher_tokens():
+    """A per-glyph cipher deforms a single word; it must not read as glued words —
+    including substitutions that produce a capital accented vowel (``tempeÍatura``)."""
+    for tok in (
+        "contrataÉo", "coMPoslçAo", "rttumrcrpAL", "manHdo", "parHcipação",
+        "tempeÍatura", "refeÍência", "EÍesentadas", "couvocnrónto",
+        "idenHﬁcada", "santanadoaçaraU", "soQdaJHP", "LICITAgAO",
+    ):
+        assert _looks_like_glued_words(tok) is False
+
+
+def test_substitution_cipher_ignores_no_space_extraction():
+    """A table-of-contents / signature block extracted without spaces is not a cipher."""
+    text = (
+        "AnexoI ModelodeProposta AnexoII MinutadoTermodeRegistrodePreços "
+        "AnexoIII ModelodePedidodeCompra AnexoIV ModelodoTermodeAdesão "
+        "AnexoV JacquelinedeSouzaMonteiro SecretariaMunicipaldeMeioAmbiente "
+        "NotadaPropostaFinanceira NotadaPropostaTécnica "
+        "SerádesclassificadooProjetoquenãoatenderàsexigênciasdoTermo "
+    ) * 12
+    assert _looks_like_substitution_cipher(text) is False
+    assert _substitution_cipher_score(text) < 0.035
+
+
+def test_substitution_cipher_strips_price_research_url_tokens():
+    """A Banco de Preços receipt: the noise tokens live inside a URL query string
+    (bidding 19332500) and must be stripped before scoring."""
+    text = (
+        "Extrato de fontes utilizadas neste relatório de pesquisa de preços "
+        "para composição do valor estimado da contratação conforme a "
+        "Instrução Normativa aplicável ao presente processo administrativo. "
+        "http://www.bancodeprecos.com.br/CertificadoAutenticidade?"
+        "token=v6iHJuY%252f2NgclBvPbBa6v6i5phDA2CXDD1IfOl17n%252f8qHU8nPtm6WA "
+    ) * 20
+    assert _looks_like_substitution_cipher(text) is False
+
+
 def test_substitution_cipher_ignores_repeated_jargon():
     """A window whose 'cipher-shaped' tokens are one identifier repeated verbatim
     (a per-glyph cipher never repeats a token) is not flagged."""
@@ -621,7 +683,9 @@ def test_strong_gate_skips_ocr_for_mild_cipher_flag():
 
 def test_extract_pdf_whole_doc_ocr_recovery(monkeypatch):
     """Whole-document substitution cipher past the STRONG bar with an ocr_handler:
-    full-doc OCR runs, every page is marked recovered, used_ocr is set."""
+    full-doc OCR runs, every page is marked recovered, used_ocr is set. Because
+    every page was re-read end to end by OCR and none stayed corrupt, the report is
+    demoted back to ``clean`` (see demote_to_clean_if_fully_ocr_recovered)."""
     pytest.importorskip("reportlab")
     import goblintools.parser as p
 
@@ -645,7 +709,7 @@ def test_extract_pdf_whole_doc_ocr_recovery(monkeypatch):
         ex.ocr_handler.extract_text_from_pdf.assert_called_once()
         rep = ex.last_extraction_report
         assert rep.used_ocr is True
-        assert rep.overall_status != "clean"
+        assert rep.overall_status == "clean"
         assert all(pg.engine == "ocr" for pg in rep.pages)
     finally:
         os.unlink(path)
