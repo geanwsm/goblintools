@@ -10,6 +10,7 @@ from pypdf import PdfWriter
 
 from goblintools import TextExtractor
 from goblintools.file_handling import FileValidator
+from goblintools.extraction_report import ExtractionReport, PageExtraction, RECOVERED
 from goblintools.parser import (
     _SUBST_CIPHER_MIDCAP_HARD,
     _is_cipher_token,
@@ -17,9 +18,14 @@ from goblintools.parser import (
     _looks_like_encoded_glyphs,
     _looks_like_glued_words,
     _looks_like_substitution_cipher,
+    _looks_like_whitespace_fragmented,
     _normalize_for_detection,
+    _recovery_is_improvement,
     _substitution_cipher_score,
     _text_layer_looks_broken,
+    _two_char_dict_rate,
+    _two_char_token_ratio,
+    _whitespace_fragment_score,
 )
 
 _FIX = Path(__file__).parent / "fixtures" / "text_layer"
@@ -755,3 +761,146 @@ def test_recover_glyph_garbage_pages_fills_report_with_engine():
     assert report.pages[0].engine == "poppler"
     assert report.pages[0].broken_before is True
     ex.ocr_handler.extract_text_from_pdf_page_indices.assert_not_called()
+
+
+# --- whitespace-fragmented text layer -------------------------------------------
+
+_FRAGMENTED_TXT = (_FIX / "fragmented_edital.txt").read_text(encoding="utf-8")
+_CLEAN_TXT = (_FIX / "clean_edital_1.txt").read_text(encoding="utf-8")
+
+
+def test_two_char_token_ratio_counts_exactly_two_char_tokens():
+    """Ratio is 2-char tokens over all word-tokens; 1-char tokens never appear."""
+    assert _two_char_token_ratio(["de", "casa", "os", "xy"]) == 0.75
+    assert _two_char_token_ratio([]) == 0.0
+
+
+def test_two_char_dict_rate_only_looks_at_two_char_tokens():
+    """Real PT-BR 2-char words hit; invented ones miss; long tokens are ignored."""
+    assert _two_char_dict_rate(["de", "os", "zz", "casa"]) == pytest.approx(2 / 3)
+    assert _two_char_dict_rate(["casa"]) == 0.0
+
+
+def test_looks_like_whitespace_fragmented_detects_fragmented_prose():
+    """Captured pages of CE_15_26.pdf whose pypdf text layer is whitespace-fragmented
+    (licitação 19210312 / bidding-information-ai)."""
+    assert _looks_like_whitespace_fragmented(_FRAGMENTED_TXT) is True
+    assert _text_layer_looks_broken(_FRAGMENTED_TXT) is True
+
+
+@pytest.mark.parametrize(
+    "name", ["clean_edital_1.txt", "clean_edital_2.txt", "clean_edital_3.txt"]
+)
+def test_looks_like_whitespace_fragmented_false_for_clean_editais(name):
+    """Real clean editais must never be flagged as fragmented."""
+    text = (_FIX / name).read_text(encoding="utf-8")
+    assert _looks_like_whitespace_fragmented(text) is False
+
+
+def test_looks_like_whitespace_fragmented_false_for_cipher_fixtures():
+    """The substitution-cipher fixtures have correct word segmentation — not this class."""
+    for name in ("cipher_edital.txt", "cipher_gazette.txt"):
+        text = (_FIX / name).read_text(encoding="utf-8")
+        assert _looks_like_whitespace_fragmented(text) is False
+
+
+def test_looks_like_whitespace_fragmented_false_for_short_text():
+    assert _looks_like_whitespace_fragmented("de a e o da do") is False
+
+
+def test_looks_like_whitespace_fragmented_false_for_unit_heavy_table():
+    """Dense unit column (un/m2/kg) has a high 2-char ratio but those tokens miss the
+    wordlist, so the corroborator floor excludes it."""
+    rows = ("un m2 kg m3 cj vb pc ml " * 3 + "escavacao manual de vala em solo ") * 25
+    assert _looks_like_whitespace_fragmented(rows) is False
+
+
+def test_looks_like_whitespace_fragmented_never_raises_on_exotic_input():
+    for junk in ("", "🙂🙂🙂", "\x00\x01\x02", "日本語 " * 80):
+        assert _looks_like_whitespace_fragmented(junk) is False
+        assert _whitespace_fragment_score(junk) == 0.0
+
+
+def test_whitespace_fragment_score_orders_fragmented_above_clean():
+    assert _whitespace_fragment_score(_FRAGMENTED_TXT) >= 0.65
+    assert _whitespace_fragment_score(_CLEAN_TXT) < 0.5
+
+
+def test_recovery_is_improvement_accepts_defragmentation():
+    """Fragmented original -> clean candidate: whole-text dict-gain is tiny (~0.06) but
+    token count collapses and the 2-char ratio drops, so the de-fragmentation branch
+    accepts where the plain dict-gain test (>= 0.15) would reject."""
+    assert _recovery_is_improvement(_FRAGMENTED_TXT, _CLEAN_TXT) is True
+
+
+def test_recovery_is_improvement_rejects_when_candidate_not_smaller():
+    """A wrongly-flagged clean page whose candidate has a similar/larger token count
+    is not accepted as de-fragmentation, and fails the dict-gain test too."""
+    assert _recovery_is_improvement(_CLEAN_TXT, _CLEAN_TXT + _CLEAN_TXT) is False
+
+
+def test_poppler_whole_doc_text_splits_on_formfeed():
+    te = TextExtractor()
+    fake = MagicMock(returncode=0, stdout=b"page one\x0cpage two\x0c")
+    with patch("goblintools.parser.shutil.which", return_value="/usr/bin/pdftotext"), \
+         patch("goblintools.parser.subprocess.run", return_value=fake):
+        out = te._poppler_whole_doc_text("x.pdf", 2)
+    assert out == ["page one", "page two"]
+
+
+def test_poppler_whole_doc_text_returns_none_on_page_count_mismatch():
+    te = TextExtractor()
+    fake = MagicMock(returncode=0, stdout=b"only one page\x0c")
+    with patch("goblintools.parser.shutil.which", return_value="/usr/bin/pdftotext"), \
+         patch("goblintools.parser.subprocess.run", return_value=fake):
+        assert te._poppler_whole_doc_text("x.pdf", 5) is None
+
+
+def test_poppler_whole_doc_text_returns_none_when_pdftotext_missing():
+    te = TextExtractor()
+    with patch("goblintools.parser.shutil.which", return_value=None):
+        assert te._poppler_whole_doc_text("x.pdf", 3) is None
+
+
+def test_recover_glyph_garbage_pages_uses_whole_doc_poppler_for_fragmentation():
+    """Document-wide fragmentation: one whole-doc pdftotext call de-fragments the pages
+    and the report marks them recovered via poppler (not one subprocess per page)."""
+    te = TextExtractor()
+    pages = [_FRAGMENTED_TXT, _FRAGMENTED_TXT, _FRAGMENTED_TXT]
+    report = ExtractionReport(path="x.pdf")
+    report.pages = [PageExtraction(index=i, engine="pypdf") for i in range(3)]
+    with patch.object(
+        te, "_poppler_whole_doc_text", return_value=[_CLEAN_TXT, _CLEAN_TXT, _CLEAN_TXT]
+    ) as whole, patch.object(
+        te, "_pdfplumber_page_text", return_value={}
+    ), patch.object(te, "_poppler_page_text", return_value={}):
+        out = te._recover_glyph_garbage_pages("x.pdf", list(pages), set(), report)
+    whole.assert_called_once()
+    assert all(not _looks_like_whitespace_fragmented(p) for p in out)
+    assert all(pe.status == RECOVERED and pe.engine == "poppler" for pe in report.pages)
+
+
+_CE_15_26 = Path("/home/gsnl/Downloads/edital/EDITAL_CE_15_26 _/CE_15_26.pdf")
+
+
+@pytest.mark.skipif(not _CE_15_26.is_file(), reason="repro PDF not present")
+def test_ce_15_26_whitespace_fragmentation_recovered():
+    """Regression: bidding doc whose pypdf text layer is whitespace-fragmented is
+    recovered via poppler; the '120 (cento e vinte) dias' clause survives and the
+    report no longer says 'clean'. (licitação 19210312 / bidding-information-ai)"""
+    te = TextExtractor()
+    txt = te.extract_from_file(str(_CE_15_26))
+    assert "cento e vinte" in txt
+    assert te.last_extraction_report.overall_status != "clean"
+    assert any(
+        pe.engine == "poppler" and pe.status == "recovered"
+        for pe in te.last_extraction_report.pages
+    )
+
+
+@pytest.mark.skipif(not _CE_15_26.is_file(), reason="repro PDF not present")
+def test_ce_15_26_short_token_ratio_exposed_on_report():
+    """The 2-char-token ratio is recorded per page even after recovery."""
+    te = TextExtractor()
+    te.extract_from_file(str(_CE_15_26))
+    assert max(pe.short_token_ratio for pe in te.last_extraction_report.pages) > 0.0

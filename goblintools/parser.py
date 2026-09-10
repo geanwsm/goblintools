@@ -153,9 +153,50 @@ _RECOVERY_DICT_GAIN = 0.15
 _POPPLER_TIMEOUT = 60
 _POPPLER_MAX_PAGE_BYTES = 8_000_000
 
+# poppler pdftotext whole-document limits (single call for document-wide fragmentation).
+_POPPLER_DOC_TIMEOUT_CAP = 300
+_POPPLER_MAX_DOC_BYTES = 64_000_000
+
+# --- whitespace-fragmented text layer ---------------------------------------
+# A producer that positions glyphs individually makes pypdf insert a space between
+# almost every glyph pair: characters correct and in order, word segmentation
+# destroyed (``"12 0 ( c e nto e v i nt e)"`` for ``"120 (cento e vinte)"``). Distinct
+# from glyph-name garbage and substitution ciphers (there the characters are wrong).
+# ``_WORD_TOKEN_RE`` already discards 1-char tokens, so the signal is the fraction of
+# exactly-2-char tokens per window. Measured: fragmented pages ~0.77-0.81; a clean
+# corpus of ~75 editais + engineering-project PDFs stays <= 0.41.
+_FRAGMENT_MIN_TOKENS = 60
+_FRAGMENT_WINDOW = 400
+_FRAGMENT_STEP = 200
+_FRAGMENT_RATIO_THRESHOLD = 0.5
+# Corroborator: the 2-char tokens of fragmented Portuguese prose are mostly real
+# words (de/da/do/em/os/as) -> ~0.75 dict-rate; a dense budget worksheet's 2-char
+# tokens (un/m2/kg) miss the wordlist -> excluded by this floor.
+_FRAGMENT_DICT_FLOOR = 0.6
+# Whole-document recovery gate: try one pdftotext call when at least this fraction of
+# the broken pages look fragmented (a document-wide producer trait, not per-page).
+_FRAGMENT_DOC_PAGE_FRACTION = 0.4
+
 
 def _tokenize_words(text: str) -> List[str]:
     return _WORD_TOKEN_RE.findall(text)
+
+
+def _two_char_token_ratio(tokens: List[str]) -> float:
+    """Fraction of word-tokens that are exactly two characters long.
+
+    ``_WORD_TOKEN_RE`` already drops 1-char tokens, so this is the whitespace-
+    fragmentation signal. Clean Portuguese prose sits at ~0.2, a fragmented text
+    layer at ~0.75+.
+    """
+    if not tokens:
+        return 0.0
+    return sum(1 for t in tokens if len(t) == 2) / len(tokens)
+
+
+def _two_char_dict_rate(tokens: List[str]) -> float:
+    """PT-BR dictionary hit-rate over just the two-char tokens (0.0 if none)."""
+    return dict_hit_rate([t for t in tokens if len(t) == 2])
 
 
 # AWS/ASME welding filler-metal classifications and similar alloy codes:
@@ -383,15 +424,89 @@ def _looks_like_substitution_cipher(
         return False
 
 
+def _fragment_windows(text: str, window: int, step: int, min_tokens: int):
+    """Yield ``(two_char_ratio, two_char_dict_rate)`` for each sliding window."""
+    tokens = _tokenize_words(_normalize_for_detection(text))
+    n = len(tokens)
+    if n < min_tokens:
+        return
+    for i in range(0, max(1, n - window + 1), step):
+        seg = tokens[i : i + window]
+        yield _two_char_token_ratio(seg), _two_char_dict_rate(seg)
+
+
+def _whitespace_fragment_score(
+    text: str,
+    *,
+    window: int = _FRAGMENT_WINDOW,
+    step: int = _FRAGMENT_STEP,
+    min_tokens: int = _FRAGMENT_MIN_TOKENS,
+) -> float:
+    """Worst-window fraction of 2-char word-tokens, over windows whose 2-char tokens
+    are also mostly real Portuguese (fragmented, not unit-heavy). 0.0 when there is
+    not enough text to judge."""
+    try:
+        return max(
+            (
+                ratio
+                for ratio, drate in _fragment_windows(text, window, step, min_tokens)
+                if drate >= _FRAGMENT_DICT_FLOOR
+            ),
+            default=0.0,
+        )
+    except Exception:
+        return 0.0
+
+
+def _looks_like_whitespace_fragmented(
+    text: str,
+    *,
+    window: int = _FRAGMENT_WINDOW,
+    step: int = _FRAGMENT_STEP,
+    min_tokens: int = _FRAGMENT_MIN_TOKENS,
+    ratio_threshold: float = _FRAGMENT_RATIO_THRESHOLD,
+    dict_floor: float = _FRAGMENT_DICT_FLOOR,
+) -> bool:
+    """True if *text* is a whitespace-fragmented PDF text layer: characters correct
+    and in order, but spurious spaces inserted mid-word so word segmentation is
+    destroyed (``"12 0 ( c e nto e v i nt e)"`` for ``"120 (cento e vinte)"``).
+
+    Distinct from :func:`_looks_like_encoded_glyphs` and
+    :func:`_looks_like_substitution_cipher` — there the characters are wrong; here
+    only the segmentation is. Signal: a sliding window where >= *ratio_threshold* of
+    word-tokens are exactly two characters (``_WORD_TOKEN_RE`` already discards
+    1-char tokens), corroborated by those two-char tokens being mostly real PT-BR
+    words (>= *dict_floor*) — a per-glyph split of Portuguese prose lands on
+    ``de``/``da``/``do``/``em``/``os``/``as``, whereas a dense budget worksheet's
+    two-char tokens (``un``/``m2``/``kg``) miss the wordlist and are excluded.
+    Measured: fragmented pages ~0.77 ratio / ~0.75 two-char dict-rate; a clean corpus
+    of ~75 editais and engineering-project PDFs stays <= 0.41 ratio.
+    """
+    try:
+        for ratio, drate in _fragment_windows(text, window, step, min_tokens):
+            if ratio >= ratio_threshold and drate >= dict_floor:
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def _text_layer_looks_broken(text: str) -> bool:
-    """Glyph-name / CID / low-letter garbage OR a per-glyph substitution cipher."""
-    return _looks_like_encoded_glyphs(text) or _looks_like_substitution_cipher(text)
+    """Glyph-name / CID / low-letter garbage, a per-glyph substitution cipher, or a
+    whitespace-fragmented text layer."""
+    return (
+        _looks_like_encoded_glyphs(text)
+        or _looks_like_substitution_cipher(text)
+        or _looks_like_whitespace_fragmented(text)
+    )
 
 
 def _recovery_is_improvement(original: str, candidate: str) -> bool:
     """Guard against cosmetic engine swaps on a false-positive detection.
 
     If the original is unambiguous glyph-name/CID garbage, any clean candidate wins.
+    If the original looks whitespace-fragmented, accept a candidate that de-fragments
+    it (far fewer 2-char tokens, token count collapsing) without losing Portuguese.
     Otherwise (only the substitution-cipher heuristic flagged it) the candidate must
     be clearly more Portuguese before the page is replaced.
     """
@@ -400,8 +515,37 @@ def _recovery_is_improvement(original: str, candidate: str) -> bool:
     cand_tokens = _tokenize_words(candidate)
     if len(cand_tokens) < _RECOVERY_MIN_CANDIDATE_TOKENS:
         return False
-    gain = dict_hit_rate(cand_tokens) - dict_hit_rate(_tokenize_words(original))
+    orig_tokens = _tokenize_words(original)
+
+    # De-fragmentation: a whitespace-fragmented original barely moves the whole-text
+    # dict hit-rate when fixed (~0.06 gain), so the plain test below never clears it.
+    # Accept a candidate that collapses the 2-char-token glut and the token count
+    # without losing Portuguese.
+    if _looks_like_whitespace_fragmented(original) and not _looks_like_whitespace_fragmented(
+        candidate
+    ):
+        orig_ratio = _two_char_token_ratio(orig_tokens)
+        if (
+            orig_ratio > 0
+            and _two_char_token_ratio(cand_tokens) <= 0.5 * orig_ratio
+            and len(cand_tokens) <= 0.7 * len(orig_tokens)
+            and dict_hit_rate(cand_tokens) >= dict_hit_rate(orig_tokens) - 0.02
+        ):
+            return True
+
+    gain = dict_hit_rate(cand_tokens) - dict_hit_rate(orig_tokens)
     return gain >= _RECOVERY_DICT_GAIN
+
+
+def _annotate_short_token_ratios(
+    report: ExtractionReport, page_texts: List[str]
+) -> None:
+    """Record each page's whitespace-fragmentation score on the report so downstream
+    consumers can distrust extracted numbers even when a page could not be recovered.
+    Uses :func:`_whitespace_fragment_score` (corroborated worst window), so a merely
+    unit-heavy table scores ~0 while a fragmented prose page scores ~0.8."""
+    for pe, txt in zip(report.pages, page_texts):
+        pe.short_token_ratio = round(_whitespace_fragment_score(txt or ""), 3)
 
 
 class TextExtractor:
@@ -743,6 +887,61 @@ class TextExtractor:
             out[idx] = proc.stdout.decode("utf-8", "replace")
         return out
 
+    def _poppler_whole_doc_text(
+        self, pdf_path: str, n_pages: int
+    ) -> Optional[List[str]]:
+        """Best-effort per-page text for the whole PDF via a single ``pdftotext`` call.
+
+        Used when whitespace fragmentation looks document-wide: one subprocess instead
+        of one per page. ``pdftotext`` emits a form-feed (``\\f``) between pages, so the
+        output splits into *n_pages* blocks. Returns ``None`` (caller falls back to the
+        per-page chain) on any failure or when the block count does not match *n_pages*.
+        """
+        exe = shutil.which("pdftotext")
+        if not exe:
+            log_warning(
+                logger,
+                "pdftotext (poppler-utils) not found on PATH; skipping whole-doc "
+                "poppler recovery step.",
+            )
+            return None
+        timeout = min(
+            _POPPLER_TIMEOUT * max(1, (n_pages + 9) // 10), _POPPLER_DOC_TIMEOUT_CAP
+        )
+        try:
+            proc = subprocess.run(
+                [exe, "-q", "--", pdf_path, "-"],
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+        except (subprocess.SubprocessError, OSError) as e:
+            log_warning(logger, f"whole-doc pdftotext failed for {pdf_path}: {e}")
+            return None
+        if proc.returncode != 0:
+            log_warning(
+                logger, f"whole-doc pdftotext exited {proc.returncode} for {pdf_path}"
+            )
+            return None
+        if len(proc.stdout) > _POPPLER_MAX_DOC_BYTES:
+            log_warning(
+                logger,
+                f"whole-doc pdftotext output for {pdf_path} exceeds "
+                f"{_POPPLER_MAX_DOC_BYTES} bytes; discarding.",
+            )
+            return None
+        blocks = proc.stdout.decode("utf-8", "replace").split("\f")
+        if blocks and not blocks[-1].strip():
+            blocks = blocks[:-1]
+        if len(blocks) != n_pages:
+            log_warning(
+                logger,
+                f"whole-doc pdftotext for {pdf_path}: {len(blocks)} page block(s) vs "
+                f"{n_pages} pypdf page(s); using per-page fallback.",
+            )
+            return None
+        return blocks[:n_pages]
+
     def _recover_glyph_garbage_pages(
         self,
         file_path: str,
@@ -750,13 +949,14 @@ class TextExtractor:
         skip_indices: Set[int],
         report: Optional[ExtractionReport] = None,
     ) -> List[str]:
-        """Replace pages whose text layer looks broken — glyph-name garbage OR a
-        per-glyph substitution cipher.
+        """Replace pages whose text layer looks broken — glyph-name garbage, a
+        per-glyph substitution cipher, or a whitespace-fragmented layer.
 
-        Chain: pdfplumber -> poppler ``pdftotext`` -> per-page OCR (if a handler is
-        set). Pages in *skip_indices* (already handled as pypdf read failures) are
-        left alone. Mutates and returns *page_texts*; fills *report* page statuses
-        when a report is given.
+        Chain: one whole-doc ``pdftotext`` call when fragmentation looks document-wide,
+        then pdfplumber -> poppler ``pdftotext`` (per page) -> per-page OCR (if a
+        handler is set). Pages in *skip_indices* (already handled as pypdf read
+        failures) are left alone. Mutates and returns *page_texts*; fills *report*
+        page statuses when a report is given.
         """
         broken_pages = {
             i
@@ -773,8 +973,8 @@ class TextExtractor:
         log_warning(
             logger,
             f"{len(broken_pages)} page(s) of {file_path} have a broken text layer "
-            "(glyph-name garbage or per-glyph substitution cipher); trying "
-            "pdfplumber, then poppler, then OCR.",
+            "(glyph-name garbage, per-glyph substitution cipher, or whitespace "
+            "fragmentation); trying pdfplumber, then poppler, then OCR.",
         )
 
         def _mark(idx: int, status: str, engine: str) -> None:
@@ -790,6 +990,24 @@ class TextExtractor:
             return _recovery_is_improvement(page_texts[idx], cand)
 
         remaining = set(broken_pages)
+
+        # Whitespace fragmentation is usually a document-wide producer trait, not
+        # per-page corruption: when most broken pages are fragmented, one whole-doc
+        # pdftotext call is far cheaper than a subprocess per page.
+        frag_pages = {
+            i for i in broken_pages if _looks_like_whitespace_fragmented(page_texts[i])
+        }
+        if frag_pages and len(frag_pages) >= _FRAGMENT_DOC_PAGE_FRACTION * len(
+            broken_pages
+        ):
+            whole = self._poppler_whole_doc_text(file_path, len(page_texts))
+            if whole:
+                for idx in sorted(frag_pages):
+                    cand = whole[idx] if idx < len(whole) else ""
+                    if _accept(idx, cand):
+                        page_texts[idx] = cand
+                        _mark(idx, RECOVERED, "poppler")
+                        remaining.discard(idx)
 
         for engine_name, getter in (
             ("pdfplumber", self._pdfplumber_page_text),
@@ -812,7 +1030,8 @@ class TextExtractor:
                     remaining.discard(idx)
 
         # Spend OCR only on pages with strong evidence of corruption — unambiguous
-        # glyph-name garbage, or a cipher rate well past the detection threshold.
+        # glyph-name garbage, a cipher rate well past the detection threshold, or a
+        # whitespace-fragmented layer the text engines could not de-fragment.
         # Milder flags (heavily tabular pages, borderline corruption) are reported
         # as corrupt rather than OCR'd, since OCR of a table is usually worse.
         ocr_worthy = {
@@ -820,6 +1039,7 @@ class TextExtractor:
             for idx in remaining
             if _looks_like_encoded_glyphs(page_texts[idx])
             or _substitution_cipher_score(page_texts[idx]) >= _SUBST_CIPHER_MIDCAP_STRONG
+            or _looks_like_whitespace_fragmented(page_texts[idx])
         }
         if ocr_worthy and self.ocr_handler:
             logger.info(
@@ -985,6 +1205,8 @@ class TextExtractor:
             if pe.status == CLEAN and not (txt and txt.strip()):
                 pe.status = CORRUPT_UNRECOVERABLE
                 pe.engine = ""
+
+        _annotate_short_token_ratios(report, page_texts)
 
         # Whole-document safety net: catches pages that individually stayed under the
         # per-page thresholds but still add up to unreadable output, the pre-existing

@@ -71,3 +71,8 @@ def test_no_demote_when_already_clean():
     r.pages = [PageExtraction(index=0, status=CLEAN)]
     r.recompute_overall()
     assert r.demote_to_clean_if_fully_ocr_recovered() is False
+
+
+def test_page_extraction_short_token_ratio_defaults_to_zero():
+    """New field is additive with a neutral default — existing construction still works."""
+    assert PageExtraction(index=0).short_token_ratio == 0.0

@@ -23,6 +23,7 @@ class PageExtraction:
     status: str = CLEAN
     engine: str = "pypdf"          # pypdf | pdfplumber | poppler | ocr | ""
     broken_before: bool = False    # text layer looked broken before recovery
+    short_token_ratio: float = 0.0  # whitespace-fragmentation score (0 clean/tabular, ~0.8 fragmented)
 
 
 @dataclass
