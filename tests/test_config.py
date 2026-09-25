@@ -83,3 +83,10 @@ def test_archive_limits_round_trip_through_json():
         config.to_file(path)
         loaded = GoblinConfig.from_file(path)
     assert loaded.archive_limits == ArchiveLimits(max_depth=2, max_members=40)
+
+
+def test_pdf_ocr_settings_defaults_are_neutral():
+    """0.12.1 OCR knobs default to the previous behaviour: 200 dpi, every page OCR'd."""
+    config = OCRConfig()
+    assert config.pdf_ocr_dpi == 200
+    assert config.max_ocr_pages is None

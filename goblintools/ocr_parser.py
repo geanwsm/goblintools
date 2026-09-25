@@ -5,9 +5,11 @@ from typing import Dict, List, Optional, Sequence
 import boto3
 import cv2
 import numpy as np
+from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 from pathlib import Path
 from pdf2image import convert_from_path
+from pypdf import PdfReader
 import pytesseract
 import multiprocessing
 from scipy.ndimage import rotate
@@ -29,6 +31,14 @@ _TEXTRACT_TRANSIENT_CODES = frozenset({
     "ServiceUnavailableException",
     "LimitExceededException",
 })
+
+
+def _pdf_page_count(pdf_path: str) -> int:
+    """Page count without rasterizing; 0 when it cannot be read (pages are then probed)."""
+    try:
+        return len(PdfReader(pdf_path).pages)
+    except Exception:
+        return 0
 
 
 class TextractTransientError(Exception):
@@ -93,6 +103,13 @@ class OCRProcessor:
                     aws_secret_access_key=self.config.aws_secret_key,
                     aws_session_token=self.config.aws_session_token,
                 )
+            # Retries live in _textract_detect only; botocore's own retries would
+            # multiply calls per page under throttling.
+            kwargs['config'] = BotoConfig(
+                retries={'total_max_attempts': 1},
+                connect_timeout=10,
+                read_timeout=60,
+            )
             try:
                 self._textract_client = boto3.client('textract', **kwargs)
             except Exception as e:
@@ -167,44 +184,72 @@ class OCRProcessor:
 
         return pytesseract.image_to_string(corrected, lang=self.config.tesseract_lang)
 
-    def extract_text_from_pdf(self, pdf_path: str) -> str:
-        try:
-            images = convert_from_path(pdf_path)
-        except Exception as e:
-            logger.exception(f"Error converting PDF to images: {e}")
-            return ""
+    def _iter_page_images(self, pdf_path: str):
+        """Yield page images one at a time (0-based index, image).
 
-        if self._use_aws_effective:
-            extracted_texts = []
-            for image in images:
-                text = self._process_page_aws(np.array(image))
-                extracted_texts.append(text if text else "")
-            return ' '.join(extracted_texts).strip()
-        else:
-            n_workers = min(multiprocessing.cpu_count(), len(images))
-            with multiprocessing.Pool(processes=n_workers) as pool:
-                extracted_text = pool.map(self._process_page_local, images)
-            return ' '.join(extracted_text).strip()
-    
+        Rasterizing the whole document at once holds every page in memory
+        (~12 MB per A4 page at 200 dpi — a 100-page scan exceeded 1 GB and killed
+        the worker). Pages beyond ``max_ocr_pages`` (when set) are not rasterized;
+        with an unknown page count, pages are probed until pdf2image returns none.
+        """
+        page_count = _pdf_page_count(pdf_path)
+        limit = self.config.max_ocr_pages
+        if limit is not None and page_count > limit:
+            log_warning(
+                logger,
+                f"PDF has {page_count} pages; OCR stops at max_ocr_pages={limit}: {pdf_path}",
+            )
+        caps = [n for n in (page_count or None, limit) if n is not None]
+        last_page = min(caps) if caps else None
+        page_number = 0
+        while last_page is None or page_number < last_page:
+            page_number += 1
+            try:
+                images = convert_from_path(
+                    pdf_path,
+                    dpi=self.config.pdf_ocr_dpi,
+                    first_page=page_number,
+                    last_page=page_number,
+                )
+            except Exception as e:
+                logger.warning("OCR skip page %s of %s: %s", page_number - 1, pdf_path, e)
+                if not page_count:
+                    return
+                continue
+            if not images:
+                return
+            yield page_number - 1, images[0]
+
+    def extract_text_from_pdf(self, pdf_path: str) -> str:
+        return ' '.join(self.extract_text_from_pdf_by_pages(pdf_path)).strip()
+
     def extract_text_from_pdf_by_pages(self, pdf_path: str) -> List[str]:
         """Extract text from PDF returning a list of pages"""
-        try:
-            images = convert_from_path(pdf_path)
-        except Exception as e:
-            logger.exception(f"Error converting PDF to images: {e}")
-            return []
-
         if self._use_aws_effective:
-            extracted_texts = []
-            for image in images:
-                text = self._process_page_aws(np.array(image))
-                extracted_texts.append(text if text else "")
-            return extracted_texts
-        else:
-            n_workers = min(multiprocessing.cpu_count(), len(images))
-            with multiprocessing.Pool(processes=n_workers) as pool:
-                extracted_text = pool.map(self._process_page_local, images)
-            return [text if text else "" for text in extracted_text]
+            return [
+                self._process_page_aws(np.array(image)) or ""
+                for _, image in self._iter_page_images(pdf_path)
+            ]
+
+        # Tesseract keeps its parallelism, holding one batch of pages at a time.
+        n_workers = max(1, multiprocessing.cpu_count())
+        extracted: List[str] = []
+        batch = []
+        pool = None
+        try:
+            for _, image in self._iter_page_images(pdf_path):
+                batch.append(image)
+                if len(batch) == n_workers:
+                    pool = pool or multiprocessing.Pool(processes=n_workers).__enter__()
+                    extracted.extend(pool.map(self._process_page_local, batch))
+                    batch = []
+            if batch:
+                pool = pool or multiprocessing.Pool(processes=min(n_workers, len(batch))).__enter__()
+                extracted.extend(pool.map(self._process_page_local, batch))
+        finally:
+            if pool is not None:
+                pool.__exit__(None, None, None)
+        return [text if text else "" for text in extracted]
 
     def extract_text_from_pdf_page_indices(
         self, pdf_path: str, page_indices: Sequence[int]
@@ -216,7 +261,10 @@ class OCRProcessor:
                 continue
             try:
                 images = convert_from_path(
-                    pdf_path, first_page=idx + 1, last_page=idx + 1
+                    pdf_path,
+                    dpi=self.config.pdf_ocr_dpi,
+                    first_page=idx + 1,
+                    last_page=idx + 1,
                 )
             except Exception as e:
                 logger.warning("OCR skip page %s of %s: %s", idx, pdf_path, e)
