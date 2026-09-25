@@ -129,6 +129,20 @@ print(text[:200] + "..." if text else "No text extracted")
 # [extracted text content...]
 ```
 
+### From bytes (uploads, S3 objects)
+
+```python
+from goblintools import ArchiveLimits, GoblinConfig, extract_from_bytes
+
+config = GoblinConfig(archive_limits=ArchiveLimits(max_members=40))
+result = extract_from_bytes(data, "anexo.zip", config=config)
+
+result.text            # text of every member, with file_path_pwd tags
+result.reports         # {"edital.pdf": ExtractionReport, ...}
+result.overall_status  # worst status: clean / partially_recovered / corrupt_unrecoverable
+result.skipped         # what the limits left out, with the reason
+```
+
 ### PDF table extraction
 
 By default, PDF text is flattened (columns lost). Enable tables with `extract_tables=True` to append Markdown tables after each page’s text, or call `extract_tables_from_pdf` for structured data.
@@ -219,7 +233,24 @@ extractor = TextExtractor(
 )
 text = extractor.extract_from_file("document.pdf")
 # Output: file_path_pwd:"document.pdf" [AWS Textract extracted text]
+
+# Temporary credentials (STS / assumed role): pass the session token too
+extractor = TextExtractor(
+    ocr_handler=True, use_aws=True,
+    aws_access_key="ASIA...", aws_secret_key="...", aws_session_token="...",
+)
+
+# No explicit keys: let boto3 resolve them (env, profile, ECS task role).
+# Opt-in — without it, use_aws=True and no keys falls back to Tesseract.
+extractor = TextExtractor(ocr_handler=True, use_aws=True, use_default_aws_credentials=True)
+
+# Standalone images (JPEG/PNG/TIFF) are OCR'd only when asked for, so callers
+# that enable OCR for scanned PDFs do not start paying for every image.
+extractor = TextExtractor(ocr_handler=True, ocr_images=True)
+text = extractor.extract_from_file("atestado.png")
 ```
+
+Textract calls are retried only on transient errors (throttling, 5xx); definitive errors (e.g. `AccessDeniedException`) are logged with their error code and the page is skipped. Pages above the 10 MB synchronous limit are re-encoded (lower JPEG quality, then smaller scale) before being sent. Credentials are never logged.
 
 ### Configuration Management
 
@@ -258,7 +289,15 @@ extractor = TextExtractor(ocr_handler=True, config=config)
     "aws_access_key": null,
     "aws_secret_key": null,
     "aws_region": "us-east-1",
-    "tesseract_lang": "por"
+    "tesseract_lang": "por",
+    "aws_session_token": null,
+    "use_default_aws_credentials": false
+  },
+  "archive_limits": {
+    "max_depth": 3,
+    "max_members": 500,
+    "max_member_bytes": 209715200,
+    "max_total_bytes": 1073741824
   }
 }
 ```
@@ -395,6 +434,21 @@ ArchiveHandler.extract("archive.7z", "output", remove_source=False)  # Keep sour
 # Add custom archive format
 ArchiveHandler.add_format('.custom', lambda f, d: custom_extract(f, d))
 
+# Limits (decompression-bomb guard). Defaults are high (3 levels / 500 members /
+# 200 MB per member / 1 GB total) so existing callers keep their results;
+# tighten them for untrusted uploads and read what was left out.
+from goblintools import ArchiveLimits, ExtractionBudget
+
+budget = ExtractionBudget(ArchiveLimits(max_depth=3, max_members=40,
+                                        max_member_bytes=25 * 1024 * 1024,
+                                        max_total_bytes=80 * 1024 * 1024))
+FileManager.extract_files_recursive("upload.zip", "output_folder", budget=budget)
+print(budget.skipped)  # ["big.pdf: exceeds the per-member limit (...)", ...]
+```
+
+ZIP and RAR are extracted member by member and the caps are checked against the bytes actually decompressed (a lying header does not help a bomb); names with `..`, absolute paths or drive letters are skipped and symlinks are never created. Formats extracted through `patoolib` (7z, tar, ...) are checked **after** extraction — the excess never reaches the destination, but a hostile archive can still fill the temp dir while the tool runs. Archives nested deeper than `max_depth` stay closed and are listed in `budget.skipped`.
+
+```python
 # File operations with conflict resolution
 FileManager.move_file("source.txt", "destination.txt")  # Auto-renames if exists
 FileManager.delete_folder("temp_folder")
@@ -495,6 +549,9 @@ extractor_multi = TextExtractor(ocr_handler=True, config=multi_config)
 
 ### Presentations
 `.pptx`
+
+### Images (OCR, opt-in)
+`.jpg`, `.jpeg`, `.png`, `.tif`, `.tiff` (multi-page TIFF frame by frame; also detected without extension) — requires `TextExtractor(ocr_handler=True, ocr_images=True)`
 
 ### Archives
 `.zip`, `.rar`, `.7z`, `.tar`, `.gz`, `.bz2`, `.iso`, `.deb`, `.rpm`, `.jar`, `.war`, `.ear`, `.cbz`, `.cbr`, `.cb7`, `.tgz`, `.txz`, `.cbt`, `.udf`, `.ace`, `.cba`, `.arj`, `.cab`, `.chm`, `.cpio`, `.dms`, `.lha`, `.lzh`, `.lzma`, `.lzo`, `.xz`, `.zst`, `.zoo`, `.adf`, `.alz`, `.arc`, `.shn`, `.rz`, `.lrz`, `.a`, `.Z`
@@ -604,6 +661,7 @@ goblintools/
 │   ├── config.py          # GoblinConfig, OCRConfig
 │   ├── log_policy.py      # configure()
 │   ├── ocr_parser.py      # OCRProcessor
+│   ├── bytes_api.py       # extract_from_bytes, BytesExtractionResult
 │   └── retry.py           # retry_with_backoff
 ├── scripts/               # dev_extract_tables.py, dev_structured_extract.py, ...
 ├── tests/                 # Pytest tests
@@ -625,7 +683,7 @@ Install Tesseract and the Portuguese language pack. See [System Dependencies](#s
 
 ### "AWS credentials not found; falling back to local Tesseract OCR"
 
-You set `use_aws=True` but did not provide `aws_access_key` and `aws_secret_key` in `OCRConfig`. The library falls back to local Tesseract. To use AWS Textract, pass credentials explicitly in config.
+You set `use_aws=True` but did not provide `aws_access_key` and `aws_secret_key` in `OCRConfig`. The library falls back to local Tesseract. To use AWS Textract, pass credentials explicitly (plus `aws_session_token` for temporary credentials), or set `use_default_aws_credentials=True` to let boto3 use its default chain (e.g. an ECS task role).
 
 ### "No parser available for file extension"
 
@@ -647,6 +705,14 @@ The PDF's font maps character codes to custom glyph names with no working `/ToUn
 - **Out of scope**: Real-time streaming, document conversion to other formats, indexing/search, web scraping. OCR requires Tesseract (local) or AWS credentials (cloud). Table extraction from pure scans (Textract TABLES / img2table) is not included yet. Acting on `last_extraction_report` (e.g. writing `null` instead of a wrong value) is the consumer's responsibility.
 
 ---
+
+## Release highlights (0.12.0)
+
+- **Textract with temporary or role credentials**: `OCRConfig` / `TextExtractor` accept `aws_session_token`, and the opt-in `use_default_aws_credentials=True` lets boto3 resolve credentials itself (env, profile, ECS task role) instead of silently falling back to Tesseract. Previously temporary credentials failed on every call and the failure was swallowed.
+- **Textract retries that actually retry**: the old decorator wrapped a function that already swallowed every exception, so it never fired. Now only transient errors (throttling, 5xx) are retried; definitive errors are logged with their code and not repeated. Pages above the 10 MB synchronous limit are re-encoded to fit. Credentials never reach the logs.
+- **Standalone image OCR (opt-in)**: `.jpg/.jpeg/.png/.tif/.tiff` (and extensionless JPEG/PNG/TIFF by magic bytes) with `TextExtractor(ocr_handler=True, ocr_images=True)`; one `ExtractionReport` page per frame, capped at 100 frames. Images are now copied by `FileManager` like other documents; without `ocr_images` they stay empty, as before.
+- **Archive limits**: `ArchiveLimits` / `ExtractionBudget` cap depth, member count, per-member and total bytes across nested archives. ZIP/RAR are streamed member by member counting real bytes, with zip-slip protection; patool formats are trimmed after extraction and symlinks dropped. High defaults keep existing results unchanged. `ArchiveHandler.extract`, `extract_zip` and `FileManager.extract_files_recursive` gain optional `limits` / `budget`.
+- **`extract_from_bytes(data, filename)`**: one call from in-memory bytes to `BytesExtractionResult(text, reports, skipped)` with `overall_status`; archives expanded under `config.archive_limits`; a fresh extractor per call (thread-safe); never raises.
 
 ## Release highlights (0.10.2)
 
