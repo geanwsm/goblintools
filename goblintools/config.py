@@ -18,14 +18,32 @@ class OCRConfig:
     use_default_aws_credentials: bool = False
 
 @dataclass
+class ArchiveLimits:
+    """Caps applied while extracting archives (decompression-bomb guard).
+
+    Defaults are deliberately high so existing callers keep their results and
+    only abuse is stopped; consumers handling untrusted uploads should tighten
+    them (e.g. 3 / 40 / 25 MB / 80 MB). ``max_depth`` counts archive levels
+    opened, the top-level archive included.
+    """
+    max_depth: int = 3
+    max_members: int = 500
+    max_member_bytes: int = 200 * 1024 * 1024
+    max_total_bytes: int = 1024 * 1024 * 1024
+
+
+@dataclass
 class GoblinConfig:
     """Main configuration class for GoblinTools"""
     max_file_size: int = 100 * 1024 * 1024  # 100MB
     ocr: OCRConfig = None
-    
+    archive_limits: ArchiveLimits = None
+
     def __post_init__(self):
         if self.ocr is None:
             self.ocr = OCRConfig()
+        if self.archive_limits is None:
+            self.archive_limits = ArchiveLimits()
     
     @classmethod
     def from_file(cls, config_path: Union[str, Path]) -> 'GoblinConfig':
@@ -40,8 +58,9 @@ class GoblinConfig:
         # Handle nested OCR config
         ocr_data = data.pop('ocr', {})
         ocr_config = OCRConfig(**ocr_data)
-        
-        return cls(ocr=ocr_config, **data)
+        limits_data = data.pop('archive_limits', None) or {}
+
+        return cls(ocr=ocr_config, archive_limits=ArchiveLimits(**limits_data), **data)
     
     def to_file(self, config_path: Union[str, Path]) -> None:
         """Save configuration to JSON file"""

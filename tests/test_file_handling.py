@@ -235,3 +235,222 @@ def test_images_are_parseable_documents():
     """Images are copied by FileManager like other parseable documents."""
     for suffix in (".jpg", ".jpeg", ".png", ".tif", ".tiff"):
         assert suffix in FileValidator.PARSEABLE_EXTENSIONS
+
+
+# --- Archive limits (0.12.0) ---------------------------------------------------
+
+import io
+import tarfile
+
+from goblintools import ArchiveLimits, ExtractionBudget
+from goblintools.file_handling import _stream_members
+
+
+def _make_zip(path, members):
+    with zipfile.ZipFile(path, "w") as zf:
+        for name, data in members:
+            zf.writestr(name, data)
+    return str(path)
+
+
+def _files_under(root):
+    return sorted(
+        os.path.relpath(os.path.join(dirpath, name), root)
+        for dirpath, _, names in os.walk(root)
+        for name in names
+    )
+
+
+def test_zip_member_over_per_member_limit_is_skipped(tmp_path):
+    """A member bigger than max_member_bytes is left out and the partial file removed."""
+    archive = _make_zip(tmp_path / "a.zip", [("small.txt", b"x" * 10), ("big.txt", b"y" * 3000)])
+    budget = ExtractionBudget(ArchiveLimits(max_member_bytes=1000))
+
+    assert ArchiveHandler.extract(archive, str(tmp_path / "out"), budget=budget)
+
+    assert _files_under(tmp_path / "out") == ["small.txt"]
+    assert any("big.txt" in reason for reason in budget.skipped)
+
+
+def test_zip_total_limit_stops_remaining_members(tmp_path):
+    """Once the total cap is hit, the current and later members are not extracted."""
+    archive = _make_zip(tmp_path / "a.zip", [(f"m{i}.txt", b"z" * 600) for i in range(3)])
+    budget = ExtractionBudget(ArchiveLimits(max_total_bytes=1000))
+
+    ArchiveHandler.extract(archive, str(tmp_path / "out"), budget=budget)
+
+    assert _files_under(tmp_path / "out") == ["m0.txt"]
+    assert any("total" in reason for reason in budget.skipped)
+
+
+def test_zip_member_count_limit(tmp_path):
+    """Only max_members entries are extracted; the rest are reported."""
+    archive = _make_zip(tmp_path / "a.zip", [(f"m{i}.txt", b"1") for i in range(5)])
+    budget = ExtractionBudget(ArchiveLimits(max_members=2))
+
+    ArchiveHandler.extract(archive, str(tmp_path / "out"), budget=budget)
+
+    assert len(_files_under(tmp_path / "out")) == 2
+    assert any("member limit" in reason for reason in budget.skipped)
+
+
+def test_zip_members_escaping_the_root_are_skipped(tmp_path):
+    """Zip-slip style names (../, absolute) never land outside the destination."""
+    archive = _make_zip(tmp_path / "a.zip", [("../evil.txt", b"e"), ("/abs.txt", b"a"), ("ok.txt", b"o")])
+    budget = ExtractionBudget()
+    out = tmp_path / "out"
+
+    ArchiveHandler.extract(archive, str(out), budget=budget)
+
+    assert _files_under(out) == ["ok.txt"]
+    assert not (tmp_path / "evil.txt").exists()
+    assert len([r for r in budget.skipped if "escapes" in r]) == 2
+
+
+def test_nested_zip_beyond_max_depth_is_not_extracted(tmp_path):
+    """Archives nested deeper than max_depth stay closed and are reported."""
+    inner3 = _make_zip(tmp_path / "level3.zip", [("deep.txt", b"deep")])
+    inner2 = _make_zip(tmp_path / "level2.zip", [("level3.zip", open(inner3, "rb").read()), ("mid.txt", b"m")])
+    outer = _make_zip(tmp_path / "level1.zip", [("level2.zip", open(inner2, "rb").read())])
+    budget = ExtractionBudget(ArchiveLimits(max_depth=2))
+    out = tmp_path / "out"
+
+    assert FileManager.extract_files_recursive(outer, str(out), budget=budget)
+
+    files = _files_under(out)
+    assert "mid.txt" in files
+    assert "deep.txt" not in files
+    assert any("level3.zip" in r and "nesting" in r for r in budget.skipped)
+
+
+def test_budget_is_shared_across_nested_archives(tmp_path):
+    """Caps apply to the whole tree, not to each archive separately."""
+    inner = _make_zip(tmp_path / "inner.zip", [("b.txt", b"b"), ("c.txt", b"c")])
+    outer = _make_zip(tmp_path / "outer.zip", [("inner.zip", open(inner, "rb").read()), ("a.txt", b"a")])
+    budget = ExtractionBudget(ArchiveLimits(max_members=3))
+    out = tmp_path / "out"
+
+    FileManager.extract_files_recursive(outer, str(out), budget=budget)
+
+    extracted = [f for f in _files_under(out) if f.endswith(".txt")]
+    assert len(extracted) == 2
+    assert budget.members == 3
+
+
+def test_limits_argument_builds_a_budget(tmp_path):
+    """Passing limits without a budget still enforces them."""
+    archive = _make_zip(tmp_path / "a.zip", [(f"m{i}.txt", b"1") for i in range(4)])
+
+    FileManager.extract_files_recursive(archive, str(tmp_path / "out"), limits=ArchiveLimits(max_members=1))
+
+    assert len(_files_under(tmp_path / "out")) == 1
+
+
+def test_tar_is_trimmed_to_the_budget_after_extraction(tmp_path):
+    """Formats extracted by patool are checked after extraction; the excess is removed."""
+    path = tmp_path / "a.tar"
+    with tarfile.open(path, "w") as tf:
+        for i in range(3):
+            data = b"t" * 10
+            info = tarfile.TarInfo(f"t{i}.txt")
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    budget = ExtractionBudget(ArchiveLimits(max_members=2))
+
+    if not ArchiveHandler.extract(str(path), str(tmp_path / "out"), budget=budget):
+        pytest.skip("tar extraction tool not available")
+
+    assert len(_files_under(tmp_path / "out")) == 2
+    assert any("member limit" in r for r in budget.skipped)
+
+
+def test_tar_symlinks_are_dropped(tmp_path):
+    """Symlinks produced by patool formats are removed instead of moved."""
+    path = tmp_path / "links.tar"
+    with tarfile.open(path, "w") as tf:
+        data = b"real"
+        info = tarfile.TarInfo("real.txt")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+        link = tarfile.TarInfo("link.txt")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "/etc/passwd"
+        tf.addfile(link)
+    budget = ExtractionBudget()
+
+    if not ArchiveHandler.extract(str(path), str(tmp_path / "out"), budget=budget):
+        pytest.skip("tar extraction tool not available")
+
+    assert _files_under(tmp_path / "out") == ["real.txt"]
+    assert any("symlink" in r for r in budget.skipped)
+
+
+class _FakeMember:
+    def __init__(self, filename, data, is_dir=False):
+        self.filename = filename
+        self._data = data
+        self._is_dir = is_dir
+
+    def is_dir(self):
+        return self._is_dir
+
+
+class _FakeArchive:
+    """Duck-typed archive with the zipfile/rarfile member API (infolist/open/is_dir)."""
+
+    def __init__(self, members):
+        self._members = members
+
+    def infolist(self):
+        return list(self._members)
+
+    def open(self, member):
+        return io.BytesIO(member._data)
+
+
+def test_stream_members_counts_bytes_actually_read(tmp_path):
+    """The per-member cap is enforced on bytes read, whatever size a header claims (RAR path)."""
+    archive = _FakeArchive([
+        _FakeMember("dir/", b"", is_dir=True),
+        _FakeMember("ok.txt", b"k" * 10),
+        _FakeMember("bomb.txt", b"B" * 5000),
+    ])
+    budget = ExtractionBudget(ArchiveLimits(max_member_bytes=100))
+
+    _stream_members(archive, str(tmp_path), budget)
+
+    assert _files_under(tmp_path) == ["ok.txt"]
+    assert budget.total_bytes == 10
+
+
+def test_budget_restore_rolls_back_a_failed_attempt():
+    """A retried extraction does not double count members, bytes or reasons."""
+    budget = ExtractionBudget()
+    snapshot = budget.snapshot()
+    budget.commit(100)
+    budget.skip("x: reason")
+
+    budget.restore(snapshot)
+
+    assert (budget.members, budget.total_bytes, budget.skipped) == (0, 0, [])
+
+
+def test_misnamed_pdf_zip_respects_limits(tmp_path):
+    """The .pdf-that-is-a-ZIP fallback streams members under the same budget."""
+    path = tmp_path / "anexo.pdf"
+    _make_zip(path, [("a.txt", b"a"), ("b.txt", b"b" * 2000)])
+    budget = ExtractionBudget(ArchiveLimits(max_member_bytes=1000))
+
+    FileManager.extract_files_recursive(str(path), str(tmp_path / "out"), budget=budget)
+
+    assert _files_under(tmp_path / "out") == ["a.txt"]
+
+
+def test_zip_extraction_unchanged_under_default_limits(tmp_path):
+    """Small archives extract exactly as before with the default (high) limits."""
+    archive = _make_zip(tmp_path / "a.zip", [("x/one.txt", b"1"), ("two.txt", b"2")])
+
+    assert ArchiveHandler.extract(archive, str(tmp_path / "out"))
+
+    assert _files_under(tmp_path / "out") == sorted([os.path.join("x", "one.txt"), "two.txt"])
+    assert not os.path.exists(archive)

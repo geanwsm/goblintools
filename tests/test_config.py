@@ -60,3 +60,26 @@ def test_ocr_config_positional_construction_still_works():
     config = OCRConfig(True, "key", "secret", "sa-east-1")
     assert (config.use_aws, config.aws_access_key, config.aws_secret_key, config.aws_region) == (True, "key", "secret", "sa-east-1")
     assert config.tesseract_lang == "por"
+
+
+def test_archive_limits_defaults_are_high():
+    """Default caps only stop abuse, so existing callers keep their results."""
+    from goblintools import ArchiveLimits
+
+    limits = GoblinConfig.default().archive_limits
+    assert isinstance(limits, ArchiveLimits)
+    assert (limits.max_depth, limits.max_members) == (3, 500)
+    assert limits.max_member_bytes == 200 * 1024 * 1024
+    assert limits.max_total_bytes == 1024 * 1024 * 1024
+
+
+def test_archive_limits_round_trip_through_json():
+    """archive_limits survives to_file/from_file as a nested block."""
+    from goblintools import ArchiveLimits
+
+    config = GoblinConfig(archive_limits=ArchiveLimits(max_depth=2, max_members=40))
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "config.json"
+        config.to_file(path)
+        loaded = GoblinConfig.from_file(path)
+    assert loaded.archive_limits == ArchiveLimits(max_depth=2, max_members=40)

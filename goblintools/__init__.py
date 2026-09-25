@@ -1,7 +1,7 @@
-from .file_handling import FileValidator, ArchiveHandler, FileManager
+from .file_handling import FileValidator, ArchiveHandler, FileManager, ExtractionBudget
 from .parser import TextExtractor
 from .text_cleaner import TextCleaner
-from .config import GoblinConfig, OCRConfig
+from .config import GoblinConfig, OCRConfig, ArchiveLimits
 from .ocr_parser import OCRProcessor
 from .log_policy import configure
 from .table_extractor import (
@@ -20,5 +20,6 @@ __all__ = [
     'is_meaningful_table', 'normalize_table_rows',
     'StructuredExtractor', 'StructuredDocument',
     'ExtractionReport', 'PageExtraction',
+    'ArchiveLimits', 'ExtractionBudget',
 ]
 __version__ = '0.11.0'

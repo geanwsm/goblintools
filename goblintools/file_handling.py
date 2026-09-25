@@ -9,6 +9,7 @@ import rarfile
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Optional, Callable, Union
 
+from goblintools.config import ArchiveLimits
 from goblintools.retry import retry_with_backoff
 from goblintools.log_policy import _set_suppress_warnings, log_warning
 
@@ -86,6 +87,181 @@ class FileValidator:
             return None
 
 
+_COPY_CHUNK = 1024 * 1024
+
+
+class ExtractionBudget:
+    """Running totals for one (possibly nested) archive extraction.
+
+    Pass the same instance through nested calls so the caps in
+    :class:`ArchiveLimits` apply to the whole tree, not per archive. Anything
+    left out is recorded in ``skipped`` with the reason; nothing is raised.
+    """
+
+    def __init__(self, limits: Optional[ArchiveLimits] = None):
+        self.limits = limits or ArchiveLimits()
+        self.members = 0
+        self.total_bytes = 0
+        self.skipped: List[str] = []
+        self.exhausted = False
+
+    def snapshot(self):
+        return (self.members, self.total_bytes, len(self.skipped), self.exhausted)
+
+    def restore(self, snapshot) -> None:
+        """Roll back to ``snapshot`` so a retried extraction does not double count."""
+        self.members, self.total_bytes, skipped_count, self.exhausted = snapshot
+        del self.skipped[skipped_count:]
+
+    def skip(self, reason: str) -> None:
+        self.skipped.append(reason)
+        log_warning(logger, f"Archive extraction limit: {reason}")
+
+    def admit_member(self, name: str) -> bool:
+        """False once the member cap (or an earlier total-size stop) is reached."""
+        if self.exhausted:
+            return False
+        if self.members >= self.limits.max_members:
+            self.skip(
+                f"{name}: member limit ({self.limits.max_members}) reached; remaining members skipped"
+            )
+            self.exhausted = True
+            return False
+        return True
+
+    def over_limit(self, name: str, member_bytes: int) -> Optional[str]:
+        """Reason to drop a member of ``member_bytes`` bytes (read so far), else None."""
+        if member_bytes > self.limits.max_member_bytes:
+            return f"{name}: exceeds the per-member limit ({self.limits.max_member_bytes} bytes)"
+        if self.total_bytes + member_bytes > self.limits.max_total_bytes:
+            self.exhausted = True
+            return (
+                f"{name}: total extracted size limit ({self.limits.max_total_bytes} bytes) "
+                "reached; remaining members skipped"
+            )
+        return None
+
+    def commit(self, member_bytes: int) -> None:
+        self.members += 1
+        self.total_bytes += member_bytes
+
+
+def _safe_member_path(root: str, name: str) -> Optional[str]:
+    """Destination for an archive member, or None when the name escapes ``root``.
+
+    Member names are attacker-controlled: absolute paths, drive letters and
+    ``..`` segments are rejected, and the resolved path must stay under root.
+    """
+    normalized = name.replace('\\', '/')
+    if normalized.startswith('/'):
+        return None
+    parts = [part for part in normalized.split('/') if part not in ('', '.')]
+    if not parts or '..' in parts or (len(parts[0]) >= 2 and parts[0][1] == ':'):
+        return None
+    root_real = os.path.realpath(root)
+    target = os.path.realpath(os.path.join(root_real, *parts))
+    if os.path.commonpath([root_real, target]) != root_real:
+        return None
+    return target
+
+
+def _stream_members(archive, destination: str, budget: ExtractionBudget) -> None:
+    """Extract ``archive`` member by member, counting the bytes actually read.
+
+    Works with any object exposing ``infolist()`` / ``open(member)`` /
+    ``member.is_dir()`` (``zipfile.ZipFile``, ``rarfile.RarFile``). Header sizes
+    are never trusted: caps are checked against decompressed bytes, so a bomb
+    with a lying header is cut at the limit. Symlinks are never created.
+    """
+    for member in archive.infolist():
+        if member.is_dir():
+            continue
+        name = member.filename
+        if not budget.admit_member(name):
+            break
+        target = _safe_member_path(destination, name)
+        if target is None:
+            budget.skip(f"{name}: path escapes the extraction root; member skipped")
+            continue
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        written = 0
+        reason = None
+        with archive.open(member) as source, open(target, 'wb') as sink:
+            while True:
+                chunk = source.read(_COPY_CHUNK)
+                if not chunk:
+                    break
+                written += len(chunk)
+                reason = budget.over_limit(name, written)
+                if reason:
+                    break
+                sink.write(chunk)
+        if reason:
+            os.remove(target)
+            budget.skip(reason)
+            if budget.exhausted:
+                break
+            continue
+        budget.commit(written)
+
+
+def _enforce_budget_on_tree(root: str, budget: ExtractionBudget) -> None:
+    """Apply the budget to files a tool already extracted (patool formats).
+
+    This cannot stop a hostile archive from filling the temp dir during
+    extraction; it keeps the excess out of the destination. Symlinks are dropped.
+    """
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for name in sorted(filenames):
+            path = os.path.join(dirpath, name)
+            rel = os.path.relpath(path, root)
+            if os.path.islink(path):
+                os.remove(path)
+                budget.skip(f"{rel}: symlink not extracted")
+                continue
+            if not budget.admit_member(rel):
+                os.remove(path)
+                continue
+            size = os.path.getsize(path)
+            reason = budget.over_limit(rel, size)
+            if reason:
+                os.remove(path)
+                budget.skip(reason)
+                continue
+            budget.commit(size)
+
+
+def _move_tree(source_root: str, destination: str) -> None:
+    """Move every file under ``source_root`` into ``destination``, renaming on collision."""
+    for root, _, files in os.walk(source_root):
+        for name in files:
+            src_file = os.path.join(root, name)
+            rel_path = os.path.relpath(src_file, source_root)
+            dest_file = os.path.join(destination, rel_path)
+
+            base, ext = os.path.splitext(dest_file)
+            counter = 1
+            while os.path.exists(dest_file):
+                dest_file = f"{base}_{counter}{ext}"
+                counter += 1
+
+            os.makedirs(os.path.dirname(dest_file), exist_ok=True)
+            shutil.move(src_file, dest_file)
+
+
+# Formats extracted member by member under the budget (unless overridden via add_format).
+_STREAMED_OPENERS: Dict[str, Callable] = {
+    '.zip': zipfile.ZipFile,
+    '.jar': zipfile.ZipFile,
+    '.cbz': zipfile.ZipFile,
+    '.war': zipfile.ZipFile,
+    '.ear': zipfile.ZipFile,
+    '.rar': rarfile.RarFile,
+    '.cbr': rarfile.RarFile,
+}
+
+
 class ArchiveHandler:
     _SUPPORTED_FORMATS: Dict[str, Callable] = {
         # ZIP formats
@@ -150,13 +326,24 @@ class ArchiveHandler:
         '.Z': lambda f, d: patoolib.extract_archive(f, outdir=d, verbosity=-1),    # Unix compress
     }
 
+    # Extensions whose handler was replaced via add_format (not streamed).
+    _custom_formats: set = set()
+
     @classmethod
     def add_format(cls, extension: str, handler: Callable):
         """Dynamically add support for new archive formats."""
         cls._SUPPORTED_FORMATS[extension.lower()] = handler
+        cls._custom_formats.add(extension.lower())
 
     @classmethod
-    def extract(cls, file_path: str, destination: str, remove_source: bool = True) -> bool:
+    def extract(
+        cls,
+        file_path: str,
+        destination: str,
+        remove_source: bool = True,
+        limits: Optional[ArchiveLimits] = None,
+        budget: Optional[ExtractionBudget] = None,
+    ) -> bool:
         """Extract any supported archive format safely, avoiding file name collisions.
 
         Args:
@@ -164,33 +351,32 @@ class ArchiveHandler:
             destination: Directory to extract contents into.
             remove_source: If True (default), delete the archive after extraction.
                            If False, keep the source archive.
+            limits: Caps for this extraction (default: :class:`ArchiveLimits`).
+            budget: Shared :class:`ExtractionBudget` for nested extractions;
+                    takes precedence over ``limits``. Skipped members are recorded
+                    in ``budget.skipped``.
         """
         if FileValidator.is_empty(file_path):
             return False
+        budget = budget or ExtractionBudget(limits)
+        snapshot = budget.snapshot()
 
         @retry_with_backoff(max_retries=3, exceptions=(OSError, RuntimeError))
         def _do_extract():
+            budget.restore(snapshot)
             ext = Path(file_path).suffix.lower()
             with tempfile.TemporaryDirectory() as tmpdir:
-                if ext in cls._SUPPORTED_FORMATS:
-                    cls._SUPPORTED_FORMATS[ext](file_path, tmpdir)
+                opener = None if ext in cls._custom_formats else _STREAMED_OPENERS.get(ext)
+                if opener is not None:
+                    with opener(file_path) as archive:
+                        _stream_members(archive, tmpdir, budget)
                 else:
-                    patoolib.extract_archive(file_path, outdir=tmpdir, verbosity=-1)
-
-                for root, _, files in os.walk(tmpdir):
-                    for name in files:
-                        src_file = os.path.join(root, name)
-                        rel_path = os.path.relpath(src_file, tmpdir)
-                        dest_file = os.path.join(destination, rel_path)
-
-                        base, ext = os.path.splitext(dest_file)
-                        counter = 1
-                        while os.path.exists(dest_file):
-                            dest_file = f"{base}_{counter}{ext}"
-                            counter += 1
-
-                        os.makedirs(os.path.dirname(dest_file), exist_ok=True)
-                        shutil.move(src_file, dest_file)
+                    if ext in cls._SUPPORTED_FORMATS:
+                        cls._SUPPORTED_FORMATS[ext](file_path, tmpdir)
+                    else:
+                        patoolib.extract_archive(file_path, outdir=tmpdir, verbosity=-1)
+                    _enforce_budget_on_tree(tmpdir, budget)
+                _move_tree(tmpdir, destination)
 
             if remove_source:
                 os.remove(file_path)
@@ -207,25 +393,23 @@ class ArchiveHandler:
             return False
 
     @classmethod
-    def extract_zip(cls, file_path: str, destination: str, remove_source: bool = True) -> bool:
+    def extract_zip(
+        cls,
+        file_path: str,
+        destination: str,
+        remove_source: bool = True,
+        limits: Optional[ArchiveLimits] = None,
+        budget: Optional[ExtractionBudget] = None,
+    ) -> bool:
         """Extract file as ZIP using zipfile, regardless of extension. Used for Case A fallback."""
         if FileValidator.is_empty(file_path):
             return False
+        budget = budget or ExtractionBudget(limits)
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
-                zipfile.ZipFile(file_path).extractall(tmpdir)
-                for root, _, files in os.walk(tmpdir):
-                    for name in files:
-                        src_file = os.path.join(root, name)
-                        rel_path = os.path.relpath(src_file, tmpdir)
-                        dest_file = os.path.join(destination, rel_path)
-                        base, ext = os.path.splitext(dest_file)
-                        counter = 1
-                        while os.path.exists(dest_file):
-                            dest_file = f"{base}_{counter}{ext}"
-                            counter += 1
-                        os.makedirs(os.path.dirname(dest_file), exist_ok=True)
-                        shutil.move(src_file, dest_file)
+                with zipfile.ZipFile(file_path) as archive:
+                    _stream_members(archive, tmpdir, budget)
+                _move_tree(tmpdir, destination)
             if remove_source:
                 os.remove(file_path)
             return True
@@ -359,24 +543,46 @@ class FileManager:
                 logger.error(f"Error removing directory {root}: {e}")
 
     @classmethod
-    def extract_files_recursive(cls, file_path: str, destination: str) -> bool:
+    def _extract_nested(cls, destination: str, budget: ExtractionBudget, depth: int) -> None:
+        """Open archives found under ``destination`` one level deeper, within max_depth."""
+        for root, _, files in os.walk(destination):
+            for file in files:
+                source = os.path.join(root, file)
+                if not FileValidator.is_archive(source):
+                    continue
+                if depth + 1 >= budget.limits.max_depth:
+                    budget.skip(
+                        f"{file}: nesting deeper than {budget.limits.max_depth} archive levels; not extracted"
+                    )
+                    continue
+                cls.extract_files_recursive(source, root, budget=budget, _depth=depth + 1)
+
+    @classmethod
+    def extract_files_recursive(
+        cls,
+        file_path: str,
+        destination: str,
+        limits: Optional[ArchiveLimits] = None,
+        budget: Optional[ExtractionBudget] = None,
+        _depth: int = 0,
+    ) -> bool:
         """Recursively extract nested archives, or copy parseable documents as-is.
 
         If the file is an archive: extracts (and nested archives) to destination.
         If the file is a parseable document (pdf, docx, etc.): copies to destination.
         Returns False only for unsupported formats or on error.
+
+        ``limits`` / ``budget`` cap the whole tree (see :class:`ArchiveLimits`);
+        archives nested deeper than ``max_depth`` stay closed and are recorded in
+        ``budget.skipped``.
         """
         if not os.path.exists(file_path):
             return False
+        budget = budget or ExtractionBudget(limits)
 
         if FileValidator.is_archive(file_path):
-            if ArchiveHandler.extract(file_path, destination):
-                # Process extracted files for nested archives
-                for root, _, files in os.walk(destination):
-                    for file in files:
-                        source = os.path.join(root, file)
-                        if FileValidator.is_archive(source):
-                            cls.extract_files_recursive(source, root)
+            if ArchiveHandler.extract(file_path, destination, budget=budget):
+                cls._extract_nested(destination, budget, _depth)
                 return True
             # Case B fallback: extraction failed (e.g. .zip that is PDF)
             actual_ext = FileValidator.detect_extension_from_magic(file_path)
@@ -397,12 +603,8 @@ class FileManager:
         if FileValidator.is_parseable_document(file_path):
             # Case A fallback: .pdf (or other doc ext) that is actually ZIP
             if FileValidator.is_zip_by_magic(file_path):
-                if ArchiveHandler.extract_zip(file_path, destination):
-                    for root, _, files in os.walk(destination):
-                        for file in files:
-                            source = os.path.join(root, file)
-                            if FileValidator.is_archive(source):
-                                cls.extract_files_recursive(source, root)
+                if ArchiveHandler.extract_zip(file_path, destination, budget=budget):
+                    cls._extract_nested(destination, budget, _depth)
                     logger.info(f"Treating misnamed file as ZIP: {file_path}")
                     return True
             # Normal path: copy document
