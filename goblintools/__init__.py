@@ -12,6 +12,7 @@ from .table_extractor import (
 )
 from .structured import StructuredDocument, StructuredExtractor
 from .extraction_report import ExtractionReport, PageExtraction
+from .bytes_api import BytesExtractionResult, extract_from_bytes
 
 __all__ = [
     'FileValidator', 'ArchiveHandler', 'FileManager',
@@ -21,5 +22,6 @@ __all__ = [
     'StructuredExtractor', 'StructuredDocument',
     'ExtractionReport', 'PageExtraction',
     'ArchiveLimits', 'ExtractionBudget',
+    'extract_from_bytes', 'BytesExtractionResult',
 ]
 __version__ = '0.11.0'
