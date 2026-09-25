@@ -1,10 +1,11 @@
 import os
 import logging
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import boto3
 import cv2
 import numpy as np
+from botocore.exceptions import ClientError
 from pathlib import Path
 from pdf2image import convert_from_path
 import pytesseract
@@ -16,16 +17,57 @@ from goblintools.log_policy import log_warning
 
 logger = logging.getLogger(__name__)
 
+# DetectDocumentText (synchronous) rejects documents above 10 MB.
+TEXTRACT_SYNC_MAX_BYTES = 10 * 1024 * 1024
+
+# Error codes worth another attempt; anything else (AccessDenied, invalid image,
+# unsupported document) will fail the same way every time.
+_TEXTRACT_TRANSIENT_CODES = frozenset({
+    "ThrottlingException",
+    "ProvisionedThroughputExceededException",
+    "InternalServerError",
+    "ServiceUnavailableException",
+    "LimitExceededException",
+})
+
+
+class TextractTransientError(Exception):
+    """Transient Textract failure (throttling / 5xx), eligible for retry."""
+
+
+def _encode_for_textract(image, max_bytes: int = TEXTRACT_SYNC_MAX_BYTES) -> Optional[bytes]:
+    """JPEG-encode a page for DetectDocumentText under the synchronous size limit.
+
+    Steps quality down, then scale, until the payload fits. The first attempt
+    (full scale, quality 95) is OpenCV's default encoding, so pages that already
+    fit are sent exactly as before. Returns None when nothing fits.
+    """
+    frame_source = np.asarray(image)
+    for scale in (1.0, 0.75, 0.5):
+        if scale == 1.0:
+            frame = frame_source
+        else:
+            frame = cv2.resize(frame_source, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        for quality in (95, 80, 60):
+            ok, encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+            if ok and encoded.nbytes <= max_bytes:
+                return encoded.tobytes()
+    return None
+
+
 class OCRProcessor:
     def __init__(self, config: OCRConfig):
         self.config = config
         self._textract_client = None
-        # Fall back to local OCR when use_aws=True but credentials are missing
-        if config.use_aws and (not config.aws_access_key or not config.aws_secret_key):
+        has_keys = bool(config.aws_access_key and config.aws_secret_key)
+        # Fall back to local OCR when use_aws=True but no credential source was chosen
+        if config.use_aws and not has_keys and not config.use_default_aws_credentials:
             log_warning(
                 logger,
                 "AWS credentials not found; falling back to local Tesseract OCR. "
-                "Provide aws_access_key and aws_secret_key in OCRConfig to use AWS Textract.",
+                "Provide aws_access_key and aws_secret_key in OCRConfig, or set "
+                "use_default_aws_credentials=True to use the boto3 credential chain "
+                "(e.g. an ECS task role), to use AWS Textract.",
             )
             self._use_aws_effective = False
         else:
@@ -38,32 +80,68 @@ class OCRProcessor:
 
     @property
     def textract_client(self):
-        """Lazy-loaded AWS Textract client"""
+        """Lazy-loaded AWS Textract client.
+
+        Explicit keys (plus the session token, required for temporary credentials)
+        win; otherwise boto3 resolves credentials through its default chain.
+        """
         if self._textract_client is None and self._use_aws_effective:
-            if not self.config.aws_access_key or not self.config.aws_secret_key:
-                raise ValueError("AWS credentials must be provided if use_aws is True.")
-            try:
-                self._textract_client = boto3.client(
-                    'textract',
-                    region_name=self.config.aws_region,
+            kwargs = {'region_name': self.config.aws_region}
+            if self.config.aws_access_key and self.config.aws_secret_key:
+                kwargs.update(
                     aws_access_key_id=self.config.aws_access_key,
-                    aws_secret_access_key=self.config.aws_secret_key
+                    aws_secret_access_key=self.config.aws_secret_key,
+                    aws_session_token=self.config.aws_session_token,
                 )
+            try:
+                self._textract_client = boto3.client('textract', **kwargs)
             except Exception as e:
-                logger.error(f"Failed to initialize AWS Textract client: {e}")
+                # Type only: the message of a client-construction error may echo arguments.
+                logger.error(f"Failed to initialize AWS Textract client: {type(e).__name__}")
                 raise
         return self._textract_client
 
-    @retry_with_backoff(max_retries=3, exceptions=(Exception,))
     def _process_page_aws(self, image):
-        _, img_encoded = cv2.imencode('.jpg', image)
-        img_bytes = img_encoded.tobytes()
+        img_bytes = _encode_for_textract(image)
+        if img_bytes is None:
+            log_warning(
+                logger,
+                "Page image exceeds the Textract synchronous limit even after downscaling; page skipped.",
+            )
+            return ""
+        try:
+            return self._textract_detect(img_bytes)
+        except TextractTransientError as e:
+            log_warning(logger, f"AWS Textract unavailable after retries ({e}); page skipped.")
+            return ""
 
+    @retry_with_backoff(max_retries=3, initial_delay=0.5, exceptions=(TextractTransientError,))
+    def _textract_detect(self, img_bytes: bytes) -> str:
         try:
             response = self.textract_client.detect_document_text(Document={'Bytes': img_bytes})
-            return '\n'.join(item['Text'] for item in response['Blocks'] if item['BlockType'] == 'LINE')
+        except ClientError as e:
+            code = e.response.get('Error', {}).get('Code', '')
+            if code in _TEXTRACT_TRANSIENT_CODES:
+                raise TextractTransientError(code) from e
+            log_warning(logger, f"AWS Textract rejected the page ({code or 'unknown error'}).")
+            return ""
         except Exception as e:
-            logger.exception(f"Error during AWS Textract processing: {e}")
+            logger.error(f"Error during AWS Textract processing: {type(e).__name__}")
+            return ""
+        return '\n'.join(
+            item['Text']
+            for item in response.get('Blocks', [])
+            if item.get('BlockType') == 'LINE' and item.get('Text')
+        )
+
+    def extract_text_from_image(self, image) -> str:
+        """OCR one in-memory image (PIL image or ndarray) with the configured engine."""
+        try:
+            if self._use_aws_effective:
+                return (self._process_page_aws(np.asarray(image)) or "").strip()
+            return (self._process_page_local(image) or "").strip()
+        except Exception as e:
+            logger.error(f"Error during image OCR: {type(e).__name__}")
             return ""
 
     @retry_with_backoff(max_retries=3, exceptions=(Exception,))

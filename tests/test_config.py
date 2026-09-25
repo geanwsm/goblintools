@@ -46,3 +46,17 @@ def test_config_from_file_not_found():
     """Test from_file raises when file does not exist."""
     with pytest.raises(FileNotFoundError):
         GoblinConfig.from_file("/nonexistent/path/config.json")
+
+
+def test_ocr_config_new_fields_default_off():
+    """0.12.0 fields are neutral by default: no token, no default credential chain."""
+    config = OCRConfig()
+    assert config.aws_session_token is None
+    assert config.use_default_aws_credentials is False
+
+
+def test_ocr_config_positional_construction_still_works():
+    """TextExtractor builds OCRConfig positionally; new fields must not shift the old ones."""
+    config = OCRConfig(True, "key", "secret", "sa-east-1")
+    assert (config.use_aws, config.aws_access_key, config.aws_secret_key, config.aws_region) == (True, "key", "secret", "sa-east-1")
+    assert config.tesseract_lang == "por"

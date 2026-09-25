@@ -904,3 +904,16 @@ def test_ce_15_26_short_token_ratio_exposed_on_report():
     te = TextExtractor()
     te.extract_from_file(str(_CE_15_26))
     assert max(pe.short_token_ratio for pe in te.last_extraction_report.pages) > 0.0
+
+
+def test_text_extractor_forwards_default_credentials_option():
+    """TextExtractor kwargs reach OCRConfig so a role-only deployment can use Textract."""
+    extractor = TextExtractor(ocr_handler=True, use_aws=True, use_default_aws_credentials=True)
+    assert extractor.config.ocr.use_default_aws_credentials is True
+    assert extractor.ocr_handler.use_aws is True
+
+
+def test_text_extractor_forwards_session_token():
+    """The session token given to TextExtractor ends up in OCRConfig."""
+    extractor = TextExtractor(use_aws=True, aws_access_key="k", aws_secret_key="s", aws_session_token="t")
+    assert extractor.config.ocr.aws_session_token == "t"

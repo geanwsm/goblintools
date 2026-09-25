@@ -11,6 +11,11 @@ class OCRConfig:
     aws_secret_key: Optional[str] = None
     aws_region: str = 'us-east-1'
     tesseract_lang: str = 'por'
+    # Appended (not inserted) so positional OCRConfig(...) calls keep working.
+    aws_session_token: Optional[str] = None
+    # Opt-in: with use_aws=True and no explicit keys, let boto3 resolve credentials
+    # itself (env, profile, ECS task role) instead of falling back to Tesseract.
+    use_default_aws_credentials: bool = False
 
 @dataclass
 class GoblinConfig:

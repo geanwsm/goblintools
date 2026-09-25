@@ -562,6 +562,8 @@ class TextExtractor:
         suppress_warnings: Optional[bool] = None,
         extract_tables: bool = False,
         table_format: str = "markdown",
+        aws_session_token=None,
+        use_default_aws_credentials: bool = False,
     ):
         """
         Initialize the text extractor.
@@ -572,6 +574,10 @@ class TextExtractor:
             aws_access_key: AWS access key
             aws_secret_key: AWS secret key
             aws_region: AWS region
+            aws_session_token: Session token for temporary AWS credentials
+            use_default_aws_credentials: With ``use_aws`` and no explicit keys, let
+                boto3 resolve credentials (env, profile, ECS task role) instead of
+                falling back to Tesseract
             config: GoblinConfig object (overrides other parameters)
             suppress_warnings: If True/False, sets warning suppression for the process.
                 If None (default), leaves the current setting unchanged (use
@@ -584,8 +590,15 @@ class TextExtractor:
         self.config = config or GoblinConfig.default()
 
         # Override config with explicit parameters if provided
-        if any([use_aws, aws_access_key, aws_secret_key, aws_region != 'us-east-1']):
-            self.config.ocr = OCRConfig(use_aws, aws_access_key, aws_secret_key, aws_region)
+        if any([
+            use_aws, aws_access_key, aws_secret_key, aws_region != 'us-east-1',
+            aws_session_token, use_default_aws_credentials,
+        ]):
+            self.config.ocr = OCRConfig(
+                use_aws, aws_access_key, aws_secret_key, aws_region,
+                aws_session_token=aws_session_token,
+                use_default_aws_credentials=use_default_aws_credentials,
+            )
 
         if suppress_warnings is not None:
             _set_suppress_warnings(suppress_warnings)
