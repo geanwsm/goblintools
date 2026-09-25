@@ -66,7 +66,9 @@ def test_default_credentials_client_is_built_without_explicit_keys():
     processor = OCRProcessor(OCRConfig(use_aws=True, use_default_aws_credentials=True, aws_region="sa-east-1"))
     with patch("goblintools.ocr_parser.boto3.client") as client:
         processor.textract_client
-    client.assert_called_once_with("textract", region_name="sa-east-1")
+    assert client.call_args.args == ("textract",)
+    assert client.call_args.kwargs["region_name"] == "sa-east-1"
+    assert "aws_access_key_id" not in client.call_args.kwargs
 
 
 def test_explicit_keys_and_session_token_reach_boto3():
@@ -161,3 +163,165 @@ def test_extract_text_from_image_uses_textract_when_enabled():
     processor = _processor_with_client(client)
 
     assert processor.extract_text_from_image(np.zeros((20, 20, 3), dtype=np.uint8)) == "CERTIDÃO\nNEGATIVA"
+
+
+# --- Page-by-page PDF OCR and single retry layer (0.12.1) ---------------------
+
+import tracemalloc
+
+import goblintools.ocr_parser as ocr_module
+
+A4_150DPI = (1754, 1240, 3)
+
+
+def _page_image():
+    return np.ones(A4_150DPI, dtype=np.uint8)
+
+
+def _aws_processor(**config_overrides):
+    config = OCRConfig(use_aws=True, use_default_aws_credentials=True, **config_overrides)
+    processor = OCRProcessor(config)
+    processor._process_page_aws = MagicMock(side_effect=lambda image: "pagina")
+    return processor
+
+
+def test_pdf_ocr_rasterizes_one_page_at_a_time(monkeypatch):
+    """Each page is converted on its own, so memory holds one page image at a time."""
+    calls = []
+
+    def fake_convert(path, **kwargs):
+        calls.append(kwargs)
+        return [_page_image()]
+
+    monkeypatch.setattr(ocr_module, "convert_from_path", fake_convert)
+    monkeypatch.setattr(ocr_module, "_pdf_page_count", lambda path: 3)
+    processor = _aws_processor()
+
+    pages = processor.extract_text_from_pdf_by_pages("scan.pdf")
+
+    assert pages == ["pagina", "pagina", "pagina"]
+    assert [(c["first_page"], c["last_page"]) for c in calls] == [(1, 1), (2, 2), (3, 3)]
+    assert all(c["dpi"] == 200 for c in calls)
+
+
+def test_pdf_ocr_dpi_is_configurable(monkeypatch):
+    """pdf_ocr_dpi controls rasterization resolution."""
+    calls = []
+    monkeypatch.setattr(ocr_module, "convert_from_path", lambda path, **kw: calls.append(kw) or [_page_image()])
+    monkeypatch.setattr(ocr_module, "_pdf_page_count", lambda path: 1)
+
+    _aws_processor(pdf_ocr_dpi=100).extract_text_from_pdf("scan.pdf")
+
+    assert calls[0]["dpi"] == 100
+
+
+def test_pdf_ocr_has_no_page_cap_by_default(monkeypatch):
+    """Without max_ocr_pages every page is OCR'd, as before 0.12.1."""
+    calls = []
+    monkeypatch.setattr(ocr_module, "convert_from_path", lambda path, **kw: calls.append(kw) or [_page_image()])
+    monkeypatch.setattr(ocr_module, "_pdf_page_count", lambda path: 150)
+    processor = _aws_processor()
+    processor._process_page_aws = lambda image: "pagina"
+
+    assert len(processor.extract_text_from_pdf_by_pages("scan.pdf")) == 150
+    assert len(calls) == 150
+
+
+def test_pdf_ocr_stops_at_the_page_cap(monkeypatch, caplog):
+    """Pages beyond max_ocr_pages are not rasterized and the cut is logged."""
+    calls = []
+    monkeypatch.setattr(ocr_module, "convert_from_path", lambda path, **kw: calls.append(kw) or [_page_image()])
+    monkeypatch.setattr(ocr_module, "_pdf_page_count", lambda path: 5)
+
+    pages = _aws_processor(max_ocr_pages=2).extract_text_from_pdf_by_pages("scan.pdf")
+
+    assert len(pages) == 2
+    assert len(calls) == 2
+    assert "max_ocr_pages" in caplog.text
+
+
+def test_pdf_ocr_probes_pages_when_the_count_is_unknown(monkeypatch):
+    """Without a page count, pages are converted until pdf2image returns nothing."""
+    monkeypatch.setattr(ocr_module, "_pdf_page_count", lambda path: 0)
+    monkeypatch.setattr(
+        ocr_module,
+        "convert_from_path",
+        lambda path, **kw: [_page_image()] if kw["first_page"] <= 2 else [],
+    )
+
+    assert _aws_processor().extract_text_from_pdf_by_pages("scan.pdf") == ["pagina", "pagina"]
+
+
+def test_whole_document_text_keeps_the_previous_join(monkeypatch):
+    """extract_text_from_pdf still joins pages with a space, as before."""
+    monkeypatch.setattr(ocr_module, "convert_from_path", lambda path, **kw: [_page_image()])
+    monkeypatch.setattr(ocr_module, "_pdf_page_count", lambda path: 2)
+
+    assert _aws_processor().extract_text_from_pdf("scan.pdf") == "pagina pagina"
+
+
+def test_local_ocr_processes_pages_in_worker_sized_batches(monkeypatch):
+    """Tesseract keeps its parallelism but only holds one batch of page images."""
+    calls = []
+    monkeypatch.setattr(ocr_module, "convert_from_path", lambda path, **kw: calls.append(kw) or [_page_image()])
+    monkeypatch.setattr(ocr_module, "_pdf_page_count", lambda path: 5)
+    monkeypatch.setattr(ocr_module.multiprocessing, "cpu_count", lambda: 2)
+    batches = []
+
+    class _FakePool:
+        def __init__(self, processes):
+            self.processes = processes
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def map(self, func, items):
+            batches.append(len(items))
+            return ["local" for _ in items]
+
+    monkeypatch.setattr(ocr_module.multiprocessing, "Pool", _FakePool)
+    processor = OCRProcessor(OCRConfig(use_aws=False))
+
+    pages = processor.extract_text_from_pdf_by_pages("scan.pdf")
+
+    assert pages == ["local"] * 5
+    assert batches == [2, 2, 1]
+    assert len(calls) == 5
+
+
+def test_pdf_ocr_memory_peak_stays_low_for_a_50_page_scan(monkeypatch):
+    """A 50-page scan never holds more than a couple of page images (< 300 MB peak)."""
+
+    def fake_convert(path, **kwargs):
+        if "first_page" not in kwargs:
+            return [_page_image() for _ in range(50)]
+        return [_page_image()]
+
+    monkeypatch.setattr(ocr_module, "convert_from_path", fake_convert)
+    monkeypatch.setattr(ocr_module, "_pdf_page_count", lambda path: 50)
+    processor = _aws_processor()
+    # A MagicMock would keep every page in call_args_list; use a plain function.
+    processor._process_page_aws = lambda image: "pagina"
+
+    tracemalloc.start()
+    try:
+        processor.extract_text_from_pdf("scan.pdf")
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak < 300 * 1024 * 1024
+
+
+def test_textract_client_disables_botocore_retries():
+    """Retries live in goblintools only, so throttling does not multiply calls per page."""
+    processor = OCRProcessor(OCRConfig(use_aws=True, use_default_aws_credentials=True))
+    with patch("goblintools.ocr_parser.boto3.client") as client:
+        processor.textract_client
+    boto_config = client.call_args.kwargs["config"]
+    assert boto_config.retries == {"total_max_attempts": 1}
+    assert boto_config.connect_timeout == 10
+    assert boto_config.read_timeout == 60

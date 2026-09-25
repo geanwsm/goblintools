@@ -16,6 +16,11 @@ class OCRConfig:
     # Opt-in: with use_aws=True and no explicit keys, let boto3 resolve credentials
     # itself (env, profile, ECS task role) instead of falling back to Tesseract.
     use_default_aws_credentials: bool = False
+    # PDF OCR rasterizes one page at a time at this resolution (200 = pdf2image's
+    # own default, so existing results are unchanged). max_ocr_pages=None OCRs
+    # every page; set a cap to bound cost on huge scans (pages beyond it are skipped).
+    pdf_ocr_dpi: int = 200
+    max_ocr_pages: Optional[int] = None
 
 @dataclass
 class ArchiveLimits:
