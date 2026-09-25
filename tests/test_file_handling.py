@@ -208,3 +208,30 @@ def test_move_file_source_equals_destination_is_noop(temp_dir):
     assert result is True
     assert os.path.isfile(path), "file must still exist at its original path"
     assert not os.path.exists(os.path.join(temp_dir, "edital_1.pdf")), "_1 suffix must not be added"
+
+
+# --- Image detection (0.12.0) ------------------------------------------------
+
+import pytest as _pytest
+
+
+@_pytest.mark.parametrize(
+    "header, expected",
+    [
+        (b"\xff\xd8\xff\xe0" + b"\x00" * 20, ".jpg"),
+        (b"\x89PNG\r\n\x1a\n" + b"\x00" * 20, ".png"),
+        (b"II*\x00" + b"\x00" * 20, ".tif"),
+        (b"MM\x00*" + b"\x00" * 20, ".tif"),
+    ],
+)
+def test_detect_extension_from_magic_recognises_images(tmp_path, header, expected):
+    """JPEG/PNG/TIFF signatures are detected for extensionless files."""
+    path = tmp_path / "sem_extensao"
+    path.write_bytes(header)
+    assert FileValidator.detect_extension_from_magic(str(path)) == expected
+
+
+def test_images_are_parseable_documents():
+    """Images are copied by FileManager like other parseable documents."""
+    for suffix in (".jpg", ".jpeg", ".png", ".tif", ".tiff"):
+        assert suffix in FileValidator.PARSEABLE_EXTENSIONS

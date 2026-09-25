@@ -917,3 +917,99 @@ def test_text_extractor_forwards_session_token():
     """The session token given to TextExtractor ends up in OCRConfig."""
     extractor = TextExtractor(use_aws=True, aws_access_key="k", aws_secret_key="s", aws_session_token="t")
     assert extractor.config.ocr.aws_session_token == "t"
+
+
+# --- Standalone image OCR (0.12.0) -------------------------------------------
+
+from PIL import Image
+
+
+def _write_image(path, fmt="PNG", frames=1):
+    images = [Image.new("RGB", (40, 20), color=(255, 255, 255)) for _ in range(frames)]
+    if frames > 1:
+        images[0].save(path, format=fmt, save_all=True, append_images=images[1:])
+    else:
+        images[0].save(path, format=fmt)
+    return str(path)
+
+
+def _extractor_with_ocr(texts, **kwargs):
+    extractor = TextExtractor(ocr_images=True, **kwargs)
+    extractor.ocr_handler = MagicMock()
+    extractor.ocr_handler.extract_text_from_image.side_effect = list(texts)
+    return extractor
+
+
+def test_png_is_ocrd_when_image_ocr_enabled(tmp_path):
+    """A standalone PNG goes through OCR and gets a clean single-page report."""
+    path = _write_image(tmp_path / "certidao.png")
+    extractor = _extractor_with_ocr(["CERTIDÃO NEGATIVA"])
+
+    text = extractor.extract_from_file(path)
+
+    assert "CERTIDÃO NEGATIVA" in text
+    report = extractor.last_extraction_report
+    assert report.overall_status == "clean"
+    assert [p.engine for p in report.pages] == ["ocr"]
+    assert report.used_ocr is True
+
+
+def test_multipage_tiff_ocrs_every_frame(tmp_path):
+    """Each TIFF frame is OCR'd and reported as its own page."""
+    path = _write_image(tmp_path / "atestado.tif", fmt="TIFF", frames=2)
+    extractor = _extractor_with_ocr(["PAGINA UM", "PAGINA DOIS"])
+
+    text = extractor.extract_from_file(path)
+
+    assert "PAGINA UM" in text and "PAGINA DOIS" in text
+    assert len(extractor.last_extraction_report.pages) == 2
+
+
+def test_image_frame_without_text_is_reported_corrupt(tmp_path):
+    """OCR that reads nothing leaves the page marked corrupt_unrecoverable."""
+    path = _write_image(tmp_path / "branco.jpg", fmt="JPEG")
+    extractor = _extractor_with_ocr([""])
+
+    assert extractor.extract_from_file(path) == ""
+    assert extractor.last_extraction_report.overall_status == "corrupt_unrecoverable"
+
+
+def test_image_ocr_is_opt_in_even_with_an_ocr_handler(tmp_path):
+    """ocr_handler=True alone keeps images empty, so existing callers do not start paying for OCR."""
+    path = _write_image(tmp_path / "foto.png")
+    extractor = TextExtractor(ocr_handler=True)
+    extractor.ocr_handler = MagicMock()
+
+    assert extractor.extract_from_file(path) == ""
+    extractor.ocr_handler.extract_text_from_image.assert_not_called()
+    assert extractor.last_extraction_report.overall_status == "corrupt_unrecoverable"
+
+
+def test_image_ocr_without_handler_returns_empty(tmp_path):
+    """ocr_images without an OCR handler has nothing to read and returns empty."""
+    path = _write_image(tmp_path / "foto.png")
+    extractor = TextExtractor(ocr_images=True)
+
+    assert extractor.extract_from_file(path) == ""
+
+
+def test_extensionless_jpeg_is_detected_and_ocrd(tmp_path):
+    """A JPEG saved without extension is recognised by its magic bytes."""
+    path = tmp_path / "anexo"
+    Image.new("RGB", (40, 20), color=(255, 255, 255)).save(path, format="JPEG")
+    extractor = _extractor_with_ocr(["DECLARAÇÃO"])
+
+    assert "DECLARAÇÃO" in extractor.extract_from_file(str(path))
+
+
+def test_image_frames_are_capped(tmp_path, monkeypatch):
+    """A TIFF with more frames than the cap only OCRs up to the cap."""
+    import goblintools.parser as parser_module
+
+    monkeypatch.setattr(parser_module, "_IMAGE_MAX_FRAMES", 2)
+    path = _write_image(tmp_path / "muitas.tif", fmt="TIFF", frames=3)
+    extractor = _extractor_with_ocr(["A", "B", "C"])
+
+    extractor.extract_from_file(path)
+
+    assert extractor.ocr_handler.extract_text_from_image.call_count == 2

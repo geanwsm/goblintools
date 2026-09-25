@@ -30,7 +30,8 @@ class PageExtraction:
 class ExtractionReport:
     """Confidence summary for the last ``TextExtractor.extract_from_file`` call.
 
-    Populated only for PDF inputs. Reflects **only the last call** on the
+    Populated for PDF and image inputs (one page per image frame, engine
+    ``ocr``). Reflects **only the last call** on the
     extractor instance — do not share a ``TextExtractor`` across threads if you
     rely on this attribute.
     """

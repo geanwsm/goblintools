@@ -19,6 +19,7 @@ class FileValidator:
     PARSEABLE_EXTENSIONS = frozenset({
         '.pdf', '.docx', '.txt', '.pptx', '.html', '.odt', '.rtf',
         '.csv', '.xml', '.xlsx', '.xlsm', '.xls', '.ods', '.dbf',
+        '.jpg', '.jpeg', '.png', '.tif', '.tiff',
     })
 
     @staticmethod
@@ -58,6 +59,12 @@ class FileValidator:
             header = sniff[:8]
             if sniff.startswith(b'%PDF'):
                 return '.pdf'
+            if sniff.startswith(b'\xff\xd8\xff'):
+                return '.jpg'
+            if sniff.startswith(b'\x89PNG\r\n\x1a\n'):
+                return '.png'
+            if sniff.startswith((b'II*\x00', b'MM\x00*')):
+                return '.tif'
             stripped = sniff.lstrip()
             if stripped.startswith(b'{\\rtf'):
                 return '.rtf'

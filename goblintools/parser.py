@@ -25,6 +25,7 @@ from odf import text, teletype
 from odf.opendocument import load
 from odf.text import P
 import docx
+from PIL import Image, ImageSequence
 from goblintools.ocr_parser import OCRProcessor
 from goblintools.config import GoblinConfig, OCRConfig
 from goblintools.log_policy import _set_suppress_warnings, log_warning
@@ -156,6 +157,10 @@ _POPPLER_MAX_PAGE_BYTES = 8_000_000
 # poppler pdftotext whole-document limits (single call for document-wide fragmentation).
 _POPPLER_DOC_TIMEOUT_CAP = 300
 _POPPLER_MAX_DOC_BYTES = 64_000_000
+
+# Standalone images (OCR only, opt-in via TextExtractor(ocr_images=True)).
+# Frame cap bounds OCR cost on hostile multi-page TIFFs.
+_IMAGE_MAX_FRAMES = 100
 
 # --- whitespace-fragmented text layer ---------------------------------------
 # A producer that positions glyphs individually makes pypdf insert a space between
@@ -564,6 +569,7 @@ class TextExtractor:
         table_format: str = "markdown",
         aws_session_token=None,
         use_default_aws_credentials: bool = False,
+        ocr_images: bool = False,
     ):
         """
         Initialize the text extractor.
@@ -578,6 +584,9 @@ class TextExtractor:
             use_default_aws_credentials: With ``use_aws`` and no explicit keys, let
                 boto3 resolve credentials (env, profile, ECS task role) instead of
                 falling back to Tesseract
+            ocr_images: OCR standalone images (JPEG/PNG/TIFF). Opt-in so callers that
+                already enable ``ocr_handler`` for PDFs do not start paying for image
+                OCR; requires ``ocr_handler``
             config: GoblinConfig object (overrides other parameters)
             suppress_warnings: If True/False, sets warning suppression for the process.
                 If None (default), leaves the current setting unchanged (use
@@ -609,6 +618,7 @@ class TextExtractor:
             )
         self.extract_tables = extract_tables
         self.table_format = table_format
+        self.ocr_images = ocr_images
 
         if ocr_handler:
             self.ocr_handler = OCRProcessor(self.config.ocr)
@@ -647,6 +657,11 @@ class TextExtractor:
             '.xls': self._extract_xls,
             '.ods': self._extract_ods,
             '.dbf': self._extract_dbf,
+            '.jpg': self._extract_image,
+            '.jpeg': self._extract_image,
+            '.png': self._extract_image,
+            '.tif': self._extract_image,
+            '.tiff': self._extract_image,
         }
 
     def add_parser(self, extension: str, parser_func: Callable) -> None:
@@ -1320,6 +1335,44 @@ class TextExtractor:
             else:
                 merged.append(text)
         return merged
+
+    def _extract_image(self, file_path: str) -> str:
+        """OCR a standalone image (JPEG/PNG/TIFF; multi-page TIFF frame by frame).
+
+        Opt-in: without ``ocr_images`` and an OCR handler the image stays empty
+        (the pre-0.12 behaviour), logged at DEBUG so folders full of images do not
+        flood consumers' logs. Either way the report records what happened.
+        """
+        report = ExtractionReport(path=file_path)
+        self.last_extraction_report = report
+        if not (self.ocr_images and self.ocr_handler is not None):
+            logger.debug(
+                "Image OCR disabled (TextExtractor(ocr_handler=True, ocr_images=True)); skipping %s",
+                file_path,
+            )
+            report.pages.append(PageExtraction(index=0, status=CORRUPT_UNRECOVERABLE, engine=""))
+            report.recompute_overall()
+            return ""
+
+        texts: List[str] = []
+        with Image.open(file_path) as image:
+            for index, frame in enumerate(ImageSequence.Iterator(image)):
+                if index >= _IMAGE_MAX_FRAMES:
+                    log_warning(
+                        logger,
+                        f"Image has more than {_IMAGE_MAX_FRAMES} frames; OCR stopped at the cap: {file_path}",
+                    )
+                    break
+                frame_text = self.ocr_handler.extract_text_from_image(frame.convert("RGB"))
+                report.pages.append(PageExtraction(
+                    index=index,
+                    status=CLEAN if frame_text else CORRUPT_UNRECOVERABLE,
+                    engine="ocr",
+                ))
+                if frame_text:
+                    texts.append(frame_text)
+        report.recompute_overall()
+        return "\n\n".join(texts)
 
     def _extract_docx(self, file_path: str) -> str:
         """Extract text from DOCX files."""
