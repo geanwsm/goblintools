@@ -291,7 +291,9 @@ extractor = TextExtractor(ocr_handler=True, config=config)
     "aws_region": "us-east-1",
     "tesseract_lang": "por",
     "aws_session_token": null,
-    "use_default_aws_credentials": false
+    "use_default_aws_credentials": false,
+    "pdf_ocr_dpi": 200,
+    "max_ocr_pages": null
   },
   "archive_limits": {
     "max_depth": 3,
@@ -705,6 +707,11 @@ The PDF's font maps character codes to custom glyph names with no working `/ToUn
 - **Out of scope**: Real-time streaming, document conversion to other formats, indexing/search, web scraping. OCR requires Tesseract (local) or AWS credentials (cloud). Table extraction from pure scans (Textract TABLES / img2table) is not included yet. Acting on `last_extraction_report` (e.g. writing `null` instead of a wrong value) is the consumer's responsibility.
 
 ---
+
+## Release highlights (0.12.1)
+
+- **PDF OCR rasterizes one page at a time**: `convert_from_path` used to turn the whole document into images at once (~12 MB per A4 page at 200 dpi — a 100-page scan went past 1 GB and killed the worker). Pages are now converted and OCR'd one by one (Tesseract keeps its parallelism, one batch of `cpu_count` pages at a time). New `OCRConfig.pdf_ocr_dpi` (default 200, pdf2image's own default) and `OCRConfig.max_ocr_pages` (default `None`, every page OCR'd) keep existing results unchanged; set e.g. `pdf_ocr_dpi=150, max_ocr_pages=100` to bound cost on huge scans (pages beyond the cap are skipped and logged). A 50-page scan now peaks at one page image (~12 MB at 150 dpi) instead of all pages at once (~330 MB).
+- **Single retry layer for Textract**: the Textract client is built with `retries={"total_max_attempts": 1}`, `connect_timeout=10`, `read_timeout=60`, so botocore's own retries no longer multiply goblintools' transient-error retries under throttling.
 
 ## Release highlights (0.12.0)
 
