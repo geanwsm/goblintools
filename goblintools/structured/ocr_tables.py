@@ -138,7 +138,12 @@ def _words_to_matrix(words: Sequence[Dict[str, Any]], page_height: float) -> Tab
 def _tesseract_page_table(image: Any) -> TableRows:
     """Build a table matrix from one page image via Tesseract word boxes."""
     import numpy as np
-    import pytesseract
+
+    try:
+        import pytesseract
+    except ImportError:
+        logger.debug("Tesseract table OCR needs goblintools[local-ocr]; skipping page")
+        return []
 
     arr = np.array(image)
     height = arr.shape[0]
@@ -167,23 +172,20 @@ def _tesseract_page_table(image: Any) -> TableRows:
 
 def _textract_page_tables(image: Any, ocr_processor: Any) -> List[TableRows]:
     """Extract TABLE blocks via Textract AnalyzeDocument when AWS is active."""
-    import cv2
-    import numpy as np
+    from goblintools.ocr_parser import _encode_for_textract
 
     if not getattr(ocr_processor, "use_aws", False):
         return []
     client = ocr_processor.textract_client
     if client is None:
         return []
-    arr = np.array(image)
-    if len(arr.shape) == 2:
-        bgr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
-    else:
-        bgr = arr
-    _, encoded = cv2.imencode(".jpg", bgr)
+    encoded = _encode_for_textract(image)
+    if encoded is None:
+        logger.debug("Page too large for Textract TABLES; skipping")
+        return []
     try:
         response = client.analyze_document(
-            Document={"Bytes": encoded.tobytes()},
+            Document={"Bytes": encoded},
             FeatureTypes=["TABLES"],
         )
     except Exception as exc:  # noqa: BLE001

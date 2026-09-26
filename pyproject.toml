@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "goblintools"
-version = "0.12.1"
+version = "0.13.0"
 description = "Toolkit for archive extraction, OCR parsing, and file text extraction"
 authors = [{ name="Gean Matos", email="gean@webgoal.com.br" }]
 readme = "README.md"
@@ -14,7 +14,6 @@ dependencies = [
     "patool",
     "rarfile",
     "boto3",
-    "opencv-python-headless",
     "numpy",
     "pdf2image",
     "pypdf>=6.15.0",
@@ -29,11 +28,12 @@ dependencies = [
     "xlrd",
     "odfpy",
     "unidecode",
-    "pytesseract",
-    "scipy",
     "pillow"
-
 ]
+
+[project.optional-dependencies]
+# Local OCR (Tesseract with OpenCV/SciPy deskew). Not needed for AWS Textract.
+local-ocr = ["opencv-python-headless", "pytesseract", "scipy"]
 
 [project.urls]
 Homepage = "https://github.com/geanatelie/goblintools.git"

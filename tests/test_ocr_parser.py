@@ -325,3 +325,70 @@ def test_textract_client_disables_botocore_retries():
     assert boto_config.retries == {"total_max_attempts": 1}
     assert boto_config.connect_timeout == 10
     assert boto_config.read_timeout == 60
+
+
+# --- Optional local OCR / Textract without OpenCV (0.13.0) --------------------
+
+import subprocess
+from pathlib import Path
+import sys
+
+
+def test_encode_for_textract_produces_jpeg_bytes():
+    """The Textract payload is a JPEG built with Pillow (no OpenCV needed)."""
+    encoded = _encode_for_textract(np.zeros((40, 30, 3), dtype=np.uint8))
+    assert encoded[:3] == b"\xff\xd8\xff"
+
+
+def test_encode_for_textract_accepts_grayscale_and_pil_images():
+    """Grayscale arrays and PIL images are encoded as well."""
+    from PIL import Image
+
+    assert _encode_for_textract(np.zeros((40, 30), dtype=np.uint8))[:3] == b"\xff\xd8\xff"
+    assert _encode_for_textract(Image.new("RGBA", (30, 40)))[:3] == b"\xff\xd8\xff"
+
+
+def test_local_ocr_without_the_extra_warns_and_returns_empty(monkeypatch, caplog):
+    """Without goblintools[local-ocr] the Tesseract path degrades to empty text, never an exception."""
+    monkeypatch.setattr(ocr_module, "_load_local_ocr", lambda: None)
+    monkeypatch.setattr(ocr_module, "_pdf_page_count", lambda path: 2)
+    monkeypatch.setattr(ocr_module, "convert_from_path", lambda path, **kw: [_page_image()])
+    processor = OCRProcessor(OCRConfig(use_aws=False))
+
+    assert processor.extract_text_from_pdf("scan.pdf") == ""
+    assert processor.extract_text_from_pdf_page_indices("scan.pdf", [0]) == {}
+    assert processor.extract_text_from_image(np.zeros((20, 20, 3), dtype=np.uint8)) == ""
+    assert "goblintools[local-ocr]" in caplog.text
+
+
+def test_textract_path_does_not_need_the_local_ocr_extra(monkeypatch):
+    """OCR through Textract works when OpenCV/SciPy/pytesseract are absent."""
+    monkeypatch.setattr(ocr_module, "_load_local_ocr", lambda: None)
+    client = MagicMock()
+    client.detect_document_text.return_value = _lines_response("EDITAL")
+    processor = _processor_with_client(client)
+
+    assert processor.extract_text_from_image(np.zeros((20, 20, 3), dtype=np.uint8)) == "EDITAL"
+
+
+def test_package_imports_and_parses_without_the_local_ocr_extra(tmp_path):
+    """import goblintools, text parsers and extract_from_bytes work with cv2/scipy/pytesseract blocked."""
+    docx = pytest.importorskip("docx")
+    document = docx.Document()
+    document.add_paragraph("Declaração sem OCR local")
+    path = tmp_path / "declaracao.docx"
+    document.save(path)
+    code = (
+        "import sys\n"
+        "for name in ('cv2', 'scipy', 'scipy.ndimage', 'pytesseract'):\n"
+        "    sys.modules[name] = None\n"
+        "import goblintools\n"
+        "from goblintools import TextExtractor, extract_from_bytes\n"
+        f"data = open({str(path)!r}, 'rb').read()\n"
+        "print(extract_from_bytes(data, 'declaracao.docx').text)\n"
+    )
+
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=str(Path(__file__).resolve().parents[1]))
+
+    assert result.returncode == 0, result.stderr
+    assert "Declaração sem OCR local" in result.stdout

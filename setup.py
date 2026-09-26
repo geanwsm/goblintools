@@ -2,13 +2,12 @@ from setuptools import setup, find_packages
 
 setup(
     name="goblintools",
-    version="0.12.1",
+    version="0.13.0",
     packages=find_packages(exclude=["tests", "tests.*"]),
     install_requires=[
         "patool",
         "rarfile",
         "boto3",
-        "opencv-python-headless",
         "numpy",
         "pdf2image",
         "pypdf>=6.15.0",
@@ -23,14 +22,15 @@ setup(
         "xlrd",
         "odfpy",
         "unidecode",
-        "pytesseract",
-        "scipy",
         "pillow"
     ],
     author="Gean Matos",
     author_email="gean@webgoal.com.br",
     description="Toolkit for archive extraction, OCR parsing, and file text extraction",
     license="MIT",
+    extras_require={
+        "local-ocr": ["opencv-python-headless", "pytesseract", "scipy"],
+    },
     package_data={"goblintools": ["data/*.txt.gz", "data/*.LICENSE"]},
     include_package_data=True,
 )

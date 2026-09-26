@@ -90,3 +90,17 @@ def test_pdf_ocr_settings_defaults_are_neutral():
     config = OCRConfig()
     assert config.pdf_ocr_dpi == 200
     assert config.max_ocr_pages is None
+
+
+def test_local_ocr_dependencies_are_an_optional_extra():
+    """opencv, scipy and pytesseract live in the local-ocr extra, not in the required deps."""
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python < 3.11
+        pytest.skip("tomllib not available")
+    project = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())["project"]
+    required = " ".join(project["dependencies"]).lower()
+    extra = " ".join(project["optional-dependencies"]["local-ocr"]).lower()
+    for name in ("opencv-python-headless", "scipy", "pytesseract"):
+        assert name not in required
+        assert name in extra
