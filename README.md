@@ -711,6 +711,11 @@ The PDF's font maps character codes to custom glyph names with no working `/ToUn
 
 ---
 
+## Release highlights (0.13.1)
+
+- **Office files are documents, not archives**: `.docx .xlsx .xlsm .pptx .odt .ods` are ZIP containers, so `FileManager.extract_files_recursive` (and `extract_from_bytes`) used to explode them and feed their internal XML (`docProps`, styles, `Normal.dotm`…) to the parsers — the document text came back mixed with metadata. They are now copied whole, also when found inside an archive or saved with the wrong extension (`.zip`/`.pdf`/none, detected by content). **Behaviour change**: callers that extracted folders with Office files now get the parsed document text instead of raw XML parts.
+- **Deterministic folder order**: `extract_from_folder` walks directories and files in sorted order, so the combined text (and `last_extraction_reports`) no longer depends on the filesystem.
+
 ## Release highlights (0.13.0)
 
 - **Local OCR is an optional extra**: `opencv-python-headless`, `scipy` and `pytesseract` moved from the required dependencies to `goblintools[local-ocr]` and are imported only on the Tesseract path. A default install is ~300 MB lighter — relevant for Docker images that only use Textract. **Breaking for Tesseract users**: install `goblintools[local-ocr]`; without it the local path warns and returns empty text instead of failing.
