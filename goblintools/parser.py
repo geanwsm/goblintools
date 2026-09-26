@@ -736,8 +736,10 @@ class TextExtractor:
             return ""
 
         all_texts = []
-        for root, _, files in os.walk(folder_path):
-            for file in files:
+        # Sorted walk: text order must not depend on the filesystem.
+        for root, dirs, files in os.walk(folder_path):
+            dirs.sort()
+            for file in sorted(files):
                 file_path = os.path.join(root, file)
                 try:
                     if os.path.getsize(file_path) > self.config.max_file_size:

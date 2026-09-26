@@ -23,6 +23,20 @@ class FileValidator:
         '.jpg', '.jpeg', '.png', '.tif', '.tiff',
     })
 
+    # ZIP-based office formats: documents for the parser, never archives to expand.
+    OFFICE_CONTAINER_EXTENSIONS = frozenset({'.docx', '.xlsx', '.xlsm', '.pptx', '.odt', '.ods'})
+
+    @classmethod
+    def office_container_extension(cls, file_path: str) -> Optional[str]:
+        """Office extension for a ZIP-based office file (by suffix or content), else None."""
+        suffix = Path(file_path).suffix.lower()
+        if suffix in cls.OFFICE_CONTAINER_EXTENSIONS:
+            return suffix
+        detected = cls.detect_extension_from_magic(file_path)
+        if detected in cls.OFFICE_CONTAINER_EXTENSIONS:
+            return detected
+        return None
+
     @staticmethod
     def is_empty(file_path: str) -> bool:
         """Check if file is empty and optionally delete it."""
@@ -548,6 +562,8 @@ class FileManager:
         for root, _, files in os.walk(destination):
             for file in files:
                 source = os.path.join(root, file)
+                if FileValidator.office_container_extension(source):
+                    continue
                 if not FileValidator.is_archive(source):
                     continue
                 if depth + 1 >= budget.limits.max_depth:
@@ -579,6 +595,20 @@ class FileManager:
         if not os.path.exists(file_path):
             return False
         budget = budget or ExtractionBudget(limits)
+
+        # Office containers are ZIPs for patool and for the Case A fallback, but
+        # they must reach the parser whole (their XML parts are not documents).
+        office_ext = FileValidator.office_container_extension(file_path)
+        if office_ext:
+            os.makedirs(destination, exist_ok=True)
+            dest_file = os.path.join(destination, f"{Path(file_path).stem}{office_ext}")
+            base, ext = os.path.splitext(dest_file)
+            counter = 1
+            while os.path.exists(dest_file):
+                dest_file = f"{base}_{counter}{ext}"
+                counter += 1
+            shutil.copy2(file_path, dest_file)
+            return True
 
         if FileValidator.is_archive(file_path):
             if ArchiveHandler.extract(file_path, destination, budget=budget):

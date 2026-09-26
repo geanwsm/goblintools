@@ -454,3 +454,51 @@ def test_zip_extraction_unchanged_under_default_limits(tmp_path):
 
     assert _files_under(tmp_path / "out") == sorted([os.path.join("x", "one.txt"), "two.txt"])
     assert not os.path.exists(archive)
+
+
+# --- Office containers are documents, not archives (0.13.1) --------------------
+
+
+def _docx_bytes(text="Paragrafo do documento"):
+    docx = pytest.importorskip("docx")
+    document = docx.Document()
+    document.add_paragraph(text)
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+def test_docx_is_copied_as_a_document_not_exploded(tmp_path):
+    """A .docx is a ZIP for patool, but it must reach the parser whole."""
+    source = tmp_path / "declaracao.docx"
+    source.write_bytes(_docx_bytes())
+
+    assert FileManager.extract_files_recursive(str(source), str(tmp_path / "out"))
+
+    assert _files_under(tmp_path / "out") == ["declaracao.docx"]
+
+
+def test_office_files_inside_a_zip_are_not_expanded(tmp_path):
+    """DOCX/XLSX inside an archive stay as documents; their XML parts never leak out."""
+    xlsx = io.BytesIO()
+    with zipfile.ZipFile(xlsx, "w") as zf:
+        zf.writestr("xl/workbook.xml", "<workbook/>")
+    archive = _make_zip(
+        tmp_path / "pacote.zip",
+        [("anexo.docx", _docx_bytes()), ("planilha.xlsx", xlsx.getvalue()), ("nota.txt", b"nota")],
+    )
+
+    FileManager.extract_files_recursive(archive, str(tmp_path / "out"))
+
+    assert _files_under(tmp_path / "out") == ["anexo.docx", "nota.txt", "planilha.xlsx"]
+
+
+@pytest.mark.parametrize("name", ["anexo.zip", "anexo.pdf", "anexo"])
+def test_misnamed_docx_is_copied_with_the_docx_extension(tmp_path, name):
+    """A DOCX saved as .zip, .pdf or without extension is recognised by content."""
+    source = tmp_path / name
+    source.write_bytes(_docx_bytes())
+
+    assert FileManager.extract_files_recursive(str(source), str(tmp_path / "out"))
+
+    assert _files_under(tmp_path / "out") == ["anexo.docx"]

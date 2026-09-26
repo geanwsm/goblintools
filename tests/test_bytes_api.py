@@ -148,3 +148,20 @@ def test_new_names_are_exported():
     """The 0.12.0 public API is re-exported from the package root."""
     for name in ("extract_from_bytes", "BytesExtractionResult", "ArchiveLimits", "ExtractionBudget"):
         assert name in goblintools.__all__
+
+
+def test_docx_bytes_do_not_leak_office_xml_parts():
+    """DOCX bytes yield the paragraph text only, not docProps/styles XML."""
+    result = extract_from_bytes(_docx_bytes("Somente o paragrafo"), "declaracao.docx")
+
+    assert "Somente o paragrafo" in result.text
+    assert "python-docx" not in result.text
+    assert "Normal.dotm" not in result.text
+
+
+def test_docx_inside_zip_is_read_as_a_document():
+    """A DOCX packed in a ZIP is parsed as DOCX, not exploded."""
+    result = extract_from_bytes(_zip_bytes([("anexo.docx", _docx_bytes("Texto do anexo"))]), "pacote.zip")
+
+    assert "Texto do anexo" in result.text
+    assert "python-docx" not in result.text
