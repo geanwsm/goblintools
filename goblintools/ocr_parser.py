@@ -3,16 +3,15 @@ import logging
 from typing import Dict, List, Optional, Sequence
 
 import boto3
-import cv2
 import numpy as np
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
+from io import BytesIO
 from pathlib import Path
 from pdf2image import convert_from_path
+from PIL import Image
 from pypdf import PdfReader
-import pytesseract
 import multiprocessing
-from scipy.ndimage import rotate
 from goblintools.config import OCRConfig
 from goblintools.retry import retry_with_backoff
 from goblintools.log_policy import log_warning
@@ -48,21 +47,36 @@ class TextractTransientError(Exception):
 def _encode_for_textract(image, max_bytes: int = TEXTRACT_SYNC_MAX_BYTES) -> Optional[bytes]:
     """JPEG-encode a page for DetectDocumentText under the synchronous size limit.
 
-    Steps quality down, then scale, until the payload fits. The first attempt
-    (full scale, quality 95) is OpenCV's default encoding, so pages that already
-    fit are sent exactly as before. Returns None when nothing fits.
+    Steps quality down, then scale, until the payload fits (quality 95 first, as
+    before). Pillow only, so the Textract path does not need OpenCV. Returns None
+    when nothing fits.
     """
-    frame_source = np.asarray(image)
+    source = image if isinstance(image, Image.Image) else Image.fromarray(np.asarray(image))
+    if source.mode not in ("RGB", "L"):
+        source = source.convert("RGB")
     for scale in (1.0, 0.75, 0.5):
         if scale == 1.0:
-            frame = frame_source
+            frame = source
         else:
-            frame = cv2.resize(frame_source, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            size = (max(1, int(source.width * scale)), max(1, int(source.height * scale)))
+            frame = source.resize(size, Image.BOX)
         for quality in (95, 80, 60):
-            ok, encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
-            if ok and encoded.nbytes <= max_bytes:
-                return encoded.tobytes()
+            buffer = BytesIO()
+            frame.save(buffer, format="JPEG", quality=quality)
+            if buffer.tell() <= max_bytes:
+                return buffer.getvalue()
     return None
+
+
+def _load_local_ocr():
+    """(cv2, pytesseract, rotate) for Tesseract OCR, or None without goblintools[local-ocr]."""
+    try:
+        import cv2
+        import pytesseract
+        from scipy.ndimage import rotate
+    except ImportError:
+        return None
+    return cv2, pytesseract, rotate
 
 
 class OCRProcessor:
@@ -82,6 +96,19 @@ class OCRProcessor:
             self._use_aws_effective = False
         else:
             self._use_aws_effective = config.use_aws
+
+    def _local_ocr_available(self) -> bool:
+        """True when Tesseract OCR can run; warns once per processor otherwise."""
+        if _load_local_ocr() is not None:
+            return True
+        if not getattr(self, "_local_ocr_warned", False):
+            log_warning(
+                logger,
+                "Local OCR (Tesseract) requires the optional dependencies: "
+                "pip install 'goblintools[local-ocr]'. Returning no OCR text.",
+            )
+            self._local_ocr_warned = True
+        return False
 
     @property
     def use_aws(self) -> bool:
@@ -156,6 +183,8 @@ class OCRProcessor:
         try:
             if self._use_aws_effective:
                 return (self._process_page_aws(np.asarray(image)) or "").strip()
+            if not self._local_ocr_available():
+                return ""
             return (self._process_page_local(image) or "").strip()
         except Exception as e:
             logger.error(f"Error during image OCR: {type(e).__name__}")
@@ -163,6 +192,7 @@ class OCRProcessor:
 
     @retry_with_backoff(max_retries=3, exceptions=(Exception,))
     def _process_page_local(self, image):
+        cv2, pytesseract, rotate = _load_local_ocr()
         image = np.array(image)
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
@@ -231,6 +261,8 @@ class OCRProcessor:
                 for _, image in self._iter_page_images(pdf_path)
             ]
 
+        if not self._local_ocr_available():
+            return []
         # Tesseract keeps its parallelism, holding one batch of pages at a time.
         n_workers = max(1, multiprocessing.cpu_count())
         extracted: List[str] = []
@@ -256,6 +288,8 @@ class OCRProcessor:
     ) -> Dict[int, str]:
         """OCR only selected 0-based pages (e.g. PyPDF failures). Skips invalid indices."""
         out: Dict[int, str] = {}
+        if not self._use_aws_effective and not self._local_ocr_available():
+            return out
         for idx in page_indices:
             if idx < 0:
                 continue

@@ -42,15 +42,18 @@ goblintools/
 ## Installation
 
 ```bash
-pip install goblintools
+pip install goblintools               # parsers, archives, OCR via AWS Textract
+pip install "goblintools[local-ocr]"  # + local OCR with Tesseract (OpenCV, SciPy, pytesseract)
 ```
+
+Local OCR's Python dependencies (~300 MB, mostly OpenCV and SciPy) are an optional extra since 0.13.0. Without it, `import goblintools`, every parser, archive handling and Textract OCR work normally; the Tesseract path logs a warning (`pip install 'goblintools[local-ocr]'`) and returns no OCR text.
 
 ## Requirements
 
 - **Python**: 3.9 or newer
 - **pypdf**: 6.15.0 or newer (declared in package metadata; used for PDF text extraction)
 - **pdfplumber**: Used for optional PDF table detection (`extract_tables=True` / `extract_tables_from_pdf`) and as a recovery engine for broken text layers
-- **Tesseract OCR**: Required for local OCR support ([Installation Guide](https://github.com/tesseract-ocr/tesseract))
+- **Tesseract OCR**: Required for local OCR support, together with the `local-ocr` extra ([Installation Guide](https://github.com/tesseract-ocr/tesseract))
   - **Portuguese Language Pack**: Install `tesseract-ocr-por` for Portuguese text recognition
 - **Poppler**: Used by `pdf2image` (OCR) **and** by the `pdftotext` recovery step for broken text layers; install `poppler-utils` (Debian/Ubuntu) or your OS equivalent. If `pdftotext` is not on `PATH`, that recovery step is skipped with a warning.
 - **AWS Credentials**: Required for AWS Textract cloud OCR
@@ -707,6 +710,11 @@ The PDF's font maps character codes to custom glyph names with no working `/ToUn
 - **Out of scope**: Real-time streaming, document conversion to other formats, indexing/search, web scraping. OCR requires Tesseract (local) or AWS credentials (cloud). Table extraction from pure scans (Textract TABLES / img2table) is not included yet. Acting on `last_extraction_report` (e.g. writing `null` instead of a wrong value) is the consumer's responsibility.
 
 ---
+
+## Release highlights (0.13.0)
+
+- **Local OCR is an optional extra**: `opencv-python-headless`, `scipy` and `pytesseract` moved from the required dependencies to `goblintools[local-ocr]` and are imported only on the Tesseract path. A default install is ~300 MB lighter — relevant for Docker images that only use Textract. **Breaking for Tesseract users**: install `goblintools[local-ocr]`; without it the local path warns and returns empty text instead of failing.
+- **Textract no longer needs OpenCV**: pages (and `StructuredExtractor` Textract TABLES) are JPEG-encoded with Pillow, same quality/scale steps and 10 MB limit as before.
 
 ## Release highlights (0.12.1)
 
