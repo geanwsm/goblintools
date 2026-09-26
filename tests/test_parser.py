@@ -1013,3 +1013,14 @@ def test_image_frames_are_capped(tmp_path, monkeypatch):
     extractor.extract_from_file(path)
 
     assert extractor.ocr_handler.extract_text_from_image.call_count == 2
+
+
+def test_extract_from_folder_reads_files_in_stable_alphabetical_order(tmp_path):
+    """Folder text is deterministic: files and subfolders in sorted order."""
+    (tmp_path / "sub").mkdir()
+    for rel, content in [("b.txt", "BETA"), ("a.txt", "ALFA"), ("sub/c.txt", "GAMA")]:
+        (tmp_path / rel).write_text(content)
+
+    text = TextExtractor().extract_from_folder(str(tmp_path))
+
+    assert text.index("ALFA") < text.index("BETA") < text.index("GAMA")
