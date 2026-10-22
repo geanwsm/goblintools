@@ -333,50 +333,55 @@ def extract_pdf_tables(
             for page_idx in range(limit):
                 page = pdf.pages[page_idx]
                 try:
-                    if dual_strategy:
-                        candidates = _extract_page_tables_dual(page)
-                    else:
-                        raw_list = page.extract_tables() or []
-                        candidates = [
-                            [
-                                [None if cell is None else str(cell) for cell in row]
-                                for row in raw
+                    try:
+                        if dual_strategy:
+                            candidates = _extract_page_tables_dual(page)
+                        else:
+                            raw_list = page.extract_tables() or []
+                            candidates = [
+                                [
+                                    [None if cell is None else str(cell) for cell in row]
+                                    for row in raw
+                                ]
+                                for raw in raw_list
+                                if raw
                             ]
-                            for raw in raw_list
-                            if raw
-                        ]
-                except Exception as e:
-                    log_warning(
-                        logger,
-                        f"Table extraction failed on page {page_idx + 1} of {pdf_path}: {e}",
-                    )
-                    continue
-                kept_on_page = 0
-                for rows in candidates:
-                    raw_ratio, raw_sample = word_split_ratio(rows)
-                    if (
-                        raw_ratio is not None
-                        and raw_sample >= DEFAULT_MIN_WORD_SPLIT_SAMPLE
-                        and raw_ratio > DEFAULT_MAX_WORD_SPLIT_RATIO
-                    ):
+                    except Exception as e:
+                        log_warning(
+                            logger,
+                            f"Table extraction failed on page {page_idx + 1} of {pdf_path}: {e}",
+                        )
                         continue
-                    if normalize:
-                        rows = normalize_table_rows(rows)
-                    if not is_meaningful_table(
-                        rows,
-                        min_cols=min_cols,
-                        min_rows=min_rows,
-                        min_filled_cells=min_filled_cells,
-                    ):
-                        continue
-                    tables.append(
-                        {
-                            "page": page_idx + 1,
-                            "index": kept_on_page,
-                            "rows": rows,
-                        }
-                    )
-                    kept_on_page += 1
+                    kept_on_page = 0
+                    for rows in candidates:
+                        raw_ratio, raw_sample = word_split_ratio(rows)
+                        if (
+                            raw_ratio is not None
+                            and raw_sample >= DEFAULT_MIN_WORD_SPLIT_SAMPLE
+                            and raw_ratio > DEFAULT_MAX_WORD_SPLIT_RATIO
+                        ):
+                            continue
+                        if normalize:
+                            rows = normalize_table_rows(rows)
+                        if not is_meaningful_table(
+                            rows,
+                            min_cols=min_cols,
+                            min_rows=min_rows,
+                            min_filled_cells=min_filled_cells,
+                        ):
+                            continue
+                        tables.append(
+                            {
+                                "page": page_idx + 1,
+                                "index": kept_on_page,
+                                "rows": rows,
+                            }
+                        )
+                        kept_on_page += 1
+                finally:
+                    # pdfplumber caches each page's objects until the file closes; release them
+                    # now so memory stays flat on long PDFs instead of growing with page count.
+                    page.close()
     except Exception as e:
         logger.error(f"Failed to extract tables from {pdf_path}: {e}")
         return []
