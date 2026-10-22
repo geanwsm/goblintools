@@ -226,3 +226,62 @@ def test_collapse_split_header_keeps_data():
     assert out[-1][0] == "1."
     assert "Item" in (out[0][0] or "")
     assert "Notebook" in (out[-1][1] or "")
+
+
+def _make_blank_pdf(path, pages):
+    writer = PdfWriter()
+    for _ in range(pages):
+        writer.add_blank_page(width=612, height=792)
+    with open(path, "wb") as out:
+        writer.write(out)
+
+
+def _record_page_events(monkeypatch, extraction=None):
+    """Record extract/close per page, in order, to prove each page is released before the next."""
+    from pdfplumber.page import Page
+    import goblintools.table_extractor as table_extractor
+
+    events = []
+    original_close = Page.close
+    original_extraction = table_extractor._extract_page_tables_dual
+
+    def recording_close(self):
+        events.append(("close", self.page_number))
+        return original_close(self)
+
+    def recording_extraction(page):
+        events.append(("extract", page.page_number))
+        return (extraction or original_extraction)(page)
+
+    monkeypatch.setattr(Page, "close", recording_close)
+    monkeypatch.setattr(table_extractor, "_extract_page_tables_dual", recording_extraction)
+    return events
+
+
+def test_extract_pdf_tables_closes_each_page_before_the_next(monkeypatch, tmp_path):
+    pytest.importorskip("pdfplumber")
+    path = str(tmp_path / "three_pages.pdf")
+    _make_blank_pdf(path, 3)
+    events = _record_page_events(monkeypatch)
+
+    extract_pdf_tables(path)
+
+    assert events[:6] == [
+        ("extract", 1), ("close", 1),
+        ("extract", 2), ("close", 2),
+        ("extract", 3), ("close", 3),
+    ]
+
+
+def test_extract_pdf_tables_closes_page_when_extraction_fails(monkeypatch, tmp_path):
+    pytest.importorskip("pdfplumber")
+    path = str(tmp_path / "two_pages.pdf")
+    _make_blank_pdf(path, 2)
+
+    def failing_extraction(page):
+        raise RuntimeError("broken page")
+
+    events = _record_page_events(monkeypatch, extraction=failing_extraction)
+
+    assert extract_pdf_tables(path) == []
+    assert events[:4] == [("extract", 1), ("close", 1), ("extract", 2), ("close", 2)]

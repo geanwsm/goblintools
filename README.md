@@ -711,6 +711,10 @@ The PDF's font maps character codes to custom glyph names with no working `/ToUn
 
 ---
 
+## Release highlights (0.13.2)
+
+- **Flat memory on long PDFs in table extraction**: `extract_pdf_tables` (and `StructuredExtractor` on PDFs) now closes each pdfplumber page as soon as it is processed, also when the page fails. pdfplumber kept every page's parsed objects until the file closed, so memory grew with page count: a 23-page PDF with dense vector drawings peaked at ~3.5 GB and a 797-page one exceeded 4 GB; both now stay around 0.4 GB. Extracted tables are unchanged.
+
 ## Release highlights (0.13.1)
 
 - **Office files are documents, not archives**: `.docx .xlsx .xlsm .pptx .odt .ods` are ZIP containers, so `FileManager.extract_files_recursive` (and `extract_from_bytes`) used to explode them and feed their internal XML (`docProps`, styles, `Normal.dotm`…) to the parsers — the document text came back mixed with metadata. They are now copied whole, also when found inside an archive or saved with the wrong extension (`.zip`/`.pdf`/none, detected by content). **Behaviour change**: callers that extracted folders with Office files now get the parsed document text instead of raw XML parts.
