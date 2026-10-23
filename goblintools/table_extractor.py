@@ -17,6 +17,11 @@ TableRows = List[List[Cell]]
 DEFAULT_MIN_COLS = 2
 DEFAULT_MIN_ROWS = 2
 DEFAULT_MIN_FILLED_CELLS = 4
+# Pages whose decoded content stream is larger than this are skipped by table
+# extraction. Such pages are large-format vector drawings (CAD sheets); pdfminer
+# builds one object per stroke and a single 34–41 MB page needs more than 4 GB,
+# while pages up to 10 MB peak below ~0.8 GB.
+DEFAULT_MAX_PAGE_CONTENT_BYTES = 10_000_000
 
 
 def _cell_text(value: Any) -> str:
@@ -297,6 +302,18 @@ def _extract_page_tables_dual(page: Any) -> List[TableRows]:
     return out
 
 
+def _page_content_bytes(page: Any) -> int:
+    """Decoded size of a pdfplumber page's content streams, without parsing them."""
+    from pdfminer.pdftypes import resolve1
+
+    total = 0
+    for stream in page.page_obj.contents:
+        stream = resolve1(stream)
+        if hasattr(stream, "get_data"):
+            total += len(stream.get_data())
+    return total
+
+
 def extract_pdf_tables(
     pdf_path: str,
     *,
@@ -306,6 +323,7 @@ def extract_pdf_tables(
     min_filled_cells: int = DEFAULT_MIN_FILLED_CELLS,
     normalize: bool = True,
     dual_strategy: bool = True,
+    max_page_content_bytes: Optional[int] = DEFAULT_MAX_PAGE_CONTENT_BYTES,
 ) -> List[Dict[str, Union[int, TableRows]]]:
     """Extract tables from a native PDF with pdfplumber.
 
@@ -313,6 +331,9 @@ def extract_pdf_tables(
     optional normalization (empty-row drop, header collapse, continuation merge).
     When ``dual_strategy`` is True, runs lattice + stream + default extractors
     and dedupes results (better recall on editais BR).
+
+    Pages whose decoded content stream exceeds ``max_page_content_bytes`` are
+    skipped with a warning before pdfplumber parses them (``None`` disables it).
 
     Returns a list of dicts: ``{"page": 1-based int, "index": int, "rows": matrix}``.
     ``index`` is the post-filter order on that page.
@@ -333,6 +354,18 @@ def extract_pdf_tables(
             for page_idx in range(limit):
                 page = pdf.pages[page_idx]
                 try:
+                    content_bytes = _page_content_bytes(page)
+                    if (
+                        max_page_content_bytes is not None
+                        and content_bytes > max_page_content_bytes
+                    ):
+                        log_warning(
+                            logger,
+                            f"Skipping table extraction on page {page_idx + 1} of {pdf_path}: "
+                            f"content stream has {content_bytes} bytes "
+                            f"(limit {max_page_content_bytes})",
+                        )
+                        continue
                     try:
                         if dual_strategy:
                             candidates = _extract_page_tables_dual(page)

@@ -711,6 +711,10 @@ The PDF's font maps character codes to custom glyph names with no working `/ToUn
 
 ---
 
+## Release highlights (0.13.3)
+
+- **Table extraction skips huge drawing pages**: `extract_pdf_tables` (and `StructuredExtractor` on PDFs) skips pages whose decoded content stream is larger than `max_page_content_bytes` (default `DEFAULT_MAX_PAGE_CONTENT_BYTES`, 10 MB), with a warning, before pdfplumber parses them. These are large-format vector drawings (CAD sheets) where pdfminer builds one object per stroke: a single 34–41 MB page needed more than 4 GB, while pages up to 10 MB peak below ~0.8 GB. Text extraction of those pages is unchanged. Pass `max_page_content_bytes=None` to disable the limit.
+
 ## Release highlights (0.13.2)
 
 - **Flat memory on long PDFs in table extraction**: `extract_pdf_tables` (and `StructuredExtractor` on PDFs) now closes each pdfplumber page as soon as it is processed, also when the page fails. pdfplumber kept every page's parsed objects until the file closed, so memory grew with page count: a 23-page PDF with dense vector drawings peaked at ~3.5 GB and a 797-page one exceeded 4 GB; both now stay around 0.4 GB. Extracted tables are unchanged.
