@@ -285,3 +285,57 @@ def test_extract_pdf_tables_closes_page_when_extraction_fails(monkeypatch, tmp_p
 
     assert extract_pdf_tables(path) == []
     assert events[:4] == [("extract", 1), ("close", 1), ("extract", 2), ("close", 2)]
+
+
+def _make_light_and_heavy_pdf(path):
+    """Page 1: a few words. Page 2: many vector lines (a drawing-like page)."""
+    c = canvas.Canvas(path, pagesize=letter)
+    c.drawString(72, 720, "light page")
+    c.showPage()
+    for i in range(400):
+        c.line(10, i, 600, i + 1)
+    c.showPage()
+    c.save()
+
+
+def test_extract_pdf_tables_skips_page_over_content_limit(monkeypatch, tmp_path, caplog):
+    pytest.importorskip("pdfplumber")
+    path = str(tmp_path / "light_and_heavy.pdf")
+    _make_light_and_heavy_pdf(path)
+    events = _record_page_events(monkeypatch)
+
+    with caplog.at_level("WARNING", logger="goblintools.table_extractor"):
+        extract_pdf_tables(path, max_page_content_bytes=2000)
+
+    assert ("extract", 1) in events
+    assert ("extract", 2) not in events
+    assert ("close", 2) in events
+    assert "page 2" in caplog.text and "content" in caplog.text
+
+
+def test_extract_pdf_tables_default_limit_keeps_small_pages(monkeypatch, tmp_path):
+    pytest.importorskip("pdfplumber")
+    path = str(tmp_path / "light_and_heavy.pdf")
+    _make_light_and_heavy_pdf(path)
+    events = _record_page_events(monkeypatch)
+
+    extract_pdf_tables(path)
+
+    assert ("extract", 1) in events and ("extract", 2) in events
+
+
+def test_extract_pdf_tables_none_disables_content_limit(monkeypatch, tmp_path):
+    pytest.importorskip("pdfplumber")
+    path = str(tmp_path / "light_and_heavy.pdf")
+    _make_light_and_heavy_pdf(path)
+    events = _record_page_events(monkeypatch)
+
+    extract_pdf_tables(path, max_page_content_bytes=None)
+
+    assert ("extract", 2) in events
+
+
+def test_default_page_content_limit_is_10_mb():
+    from goblintools.table_extractor import DEFAULT_MAX_PAGE_CONTENT_BYTES
+
+    assert DEFAULT_MAX_PAGE_CONTENT_BYTES == 10_000_000
