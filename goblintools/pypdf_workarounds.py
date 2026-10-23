@@ -14,6 +14,7 @@ Goals:
     Do **not** replace ``get_display_str`` with the legacy copy — that causes
     ``TypeError: 'in <string>' requires string as left operand, not int`` on every
     page (seen in production with goblintools 0.9.0 + pypdf 6.15).
+    pypdf 6.20 moved ``Font`` from ``pypdf._font`` to ``pypdf.generic._font``.
 
 Apply once via :func:`apply_pypdf_extraction_workarounds`.
 """
@@ -94,7 +95,10 @@ def apply_pypdf_extraction_workarounds(*, force: bool = False) -> None:
 
 def _apply_modern_font_width_patches() -> None:
     """Minimal patches for pypdf 6.15+ (keep stock get_display_str)."""
-    from pypdf._font import Font
+    try:
+        from pypdf.generic._font import Font  # pypdf 6.20+
+    except ImportError:
+        from pypdf._font import Font
 
     if hasattr(Font, "get_text_width"):
         _orig_get_text_width = Font.get_text_width

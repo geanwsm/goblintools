@@ -17,6 +17,7 @@ pdf2image
 rarfile
 pytest
 pytest-mock
+reportlab
 setuptools
 dbfread
 pytesseract
