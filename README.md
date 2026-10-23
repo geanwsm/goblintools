@@ -711,6 +711,10 @@ The PDF's font maps character codes to custom glyph names with no working `/ToUn
 
 ---
 
+## Release highlights (0.13.4)
+
+- **Works with pypdf 6.20+**: pypdf 6.20 moved `Font` from `pypdf._font` to `pypdf.generic._font`, so `import goblintools` failed with `ModuleNotFoundError: No module named 'pypdf._font'` on any install that resolved pypdf 6.20 or newer. The pypdf workarounds now import `Font` from either location. Projects that pinned `pypdf<6.20` to work around it can drop the pin.
+
 ## Release highlights (0.13.3)
 
 - **Table extraction skips huge drawing pages**: `extract_pdf_tables` (and `StructuredExtractor` on PDFs) skips pages whose decoded content stream is larger than `max_page_content_bytes` (default `DEFAULT_MAX_PAGE_CONTENT_BYTES`, 10 MB), with a warning, before pdfplumber parses them. These are large-format vector drawings (CAD sheets) where pdfminer builds one object per stroke: a single 34–41 MB page needed more than 4 GB, while pages up to 10 MB peak below ~0.8 GB. Text extraction of those pages is unchanged. Pass `max_page_content_bytes=None` to disable the limit.

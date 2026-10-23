@@ -225,7 +225,7 @@ def test_pypdf_workarounds_modern_keeps_stock_display_str():
         def get_text_width(self, text):
             return 10 * len(text)
 
-    text, rtl, widths = te.get_display_str(
+    text, rtl, last = te.get_display_str(
         "",
         [1, 0, 0, 1, 0, 0],
         [1, 0, 0, 1, 0, 0],
@@ -237,7 +237,32 @@ def test_pypdf_workarounds_modern_keeps_stock_display_str():
         None,
     )
     assert text == "AB"
-    assert widths > 0
+    # pypdf 6.15-6.19 returns the text width; 6.20+ returns the runs completed
+    # by a direction change (none here).
+    if isinstance(last, str):
+        assert last == ""
+    else:
+        assert last > 0
+
+
+def test_pypdf_workarounds_modern_patches_font_width():
+    """On pypdf 6.15+, Font.get_text_width is wrapped wherever pypdf keeps Font."""
+    from goblintools.pypdf_workarounds import (
+        apply_pypdf_extraction_workarounds,
+        _uses_legacy_rtl_api,
+    )
+    import pytest
+
+    apply_pypdf_extraction_workarounds(force=True)
+    if _uses_legacy_rtl_api():
+        pytest.skip("modern path not used on this pypdf")
+
+    try:
+        from pypdf.generic._font import Font
+    except ImportError:
+        from pypdf._font import Font
+
+    assert Font.get_text_width.__module__ == "goblintools.pypdf_workarounds"
 
 
 def test_merge_page_texts_prefers_primary_then_secondary():
