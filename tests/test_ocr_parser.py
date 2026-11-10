@@ -556,3 +556,47 @@ def test_failed_pages_are_reset_on_every_call(monkeypatch):
 
     processor.extract_text_from_pdf_by_pages("scan.pdf")
     assert processor.last_failed_pages == {}
+
+
+def test_failed_pages_are_isolated_per_thread():
+    import threading
+
+    barrier = threading.Barrier(2, timeout=5)
+
+    def detect(Document):
+        barrier.wait()
+        if threading.current_thread().name == "rejected":
+            raise _client_error("AccessDeniedException")
+        return _lines_response("EDITAL")
+
+    client = MagicMock()
+    client.detect_document_text.side_effect = detect
+    processor = _textract_processor(client)
+    seen = {}
+
+    done = threading.Barrier(2, timeout=5)
+
+    def worker():
+        processor.extract_text_from_image(np.zeros((20, 20, 3), dtype=np.uint8))
+        done.wait()
+        seen[threading.current_thread().name] = dict(processor.last_failed_pages)
+
+    threads = [threading.Thread(target=worker, name=n) for n in ("rejected", "ok")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert seen == {"rejected": {0: "rejected:AccessDeniedException"}, "ok": {}}
+
+
+def test_processor_survives_pickle_without_its_thread_state():
+    import pickle
+
+    processor = OCRProcessor(OCRConfig())
+    processor.last_failed_pages[0] = "rasterize"
+
+    restored = pickle.loads(pickle.dumps(processor))
+
+    assert restored.last_failed_pages == {}
+    assert restored.config == processor.config

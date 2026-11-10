@@ -15,6 +15,7 @@ import multiprocessing
 from goblintools.config import OCRConfig
 from goblintools.retry import retry_with_backoff, retry_until_deadline
 from goblintools.log_policy import log_warning
+from goblintools.thread_state import ThreadLocalAttribute, ThreadLocalStateMixin
 
 logger = logging.getLogger(__name__)
 
@@ -92,11 +93,12 @@ def _load_local_ocr():
     return cv2, pytesseract, rotate
 
 
-class OCRProcessor:
+class OCRProcessor(ThreadLocalStateMixin):
+    last_failed_pages = ThreadLocalAttribute(dict)
+
     def __init__(self, config: OCRConfig):
         self.config = config
         self._textract_client = None
-        self.last_failed_pages: Dict[int, str] = {}
         has_keys = bool(config.aws_access_key and config.aws_secret_key)
         # Fall back to local OCR when use_aws=True but no credential source was chosen
         if config.use_aws and not has_keys and not config.use_default_aws_credentials:

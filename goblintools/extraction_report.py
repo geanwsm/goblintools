@@ -32,9 +32,8 @@ class ExtractionReport:
     """Confidence summary for the last ``TextExtractor.extract_from_file`` call.
 
     Populated for PDF and image inputs (one page per image frame, engine
-    ``ocr``). Reflects **only the last call** on the
-    extractor instance — do not share a ``TextExtractor`` across threads if you
-    rely on this attribute.
+    ``ocr``). Reflects **only the last call made by the current thread** on the
+    extractor instance; other threads see their own result.
     """
 
     path: str

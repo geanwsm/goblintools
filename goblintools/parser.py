@@ -27,6 +27,7 @@ from odf.text import P
 import docx
 from PIL import Image, ImageSequence
 from goblintools.ocr_parser import OCRProcessor
+from goblintools.thread_state import ThreadLocalAttribute, ThreadLocalStateMixin
 from goblintools.config import GoblinConfig, OCRConfig
 from goblintools.log_policy import _set_suppress_warnings, log_warning
 from goblintools.file_handling import FileValidator
@@ -553,8 +554,11 @@ def _annotate_short_token_ratios(
         pe.short_token_ratio = round(_whitespace_fragment_score(txt or ""), 3)
 
 
-class TextExtractor:
+class TextExtractor(ThreadLocalStateMixin):
     """Main class for handling text extraction from various file formats."""
+
+    last_extraction_report = ThreadLocalAttribute(lambda: None)
+    last_extraction_reports = ThreadLocalAttribute(dict)
 
     def __init__(
         self,
@@ -624,12 +628,6 @@ class TextExtractor:
             self.ocr_handler = OCRProcessor(self.config.ocr)
         else:
             self.ocr_handler = None
-
-        # Confidence / provenance of the most recent PDF extraction (None otherwise).
-        self.last_extraction_report: Optional[ExtractionReport] = None
-        # Per-file reports from the most recent ``extract_from_folder`` call,
-        # keyed by the same relative path used in the ``file_path_pwd`` tag.
-        self.last_extraction_reports: Dict[str, ExtractionReport] = {}
 
         self._parsers = None  # Lazy initialization
 
