@@ -1175,3 +1175,55 @@ def test_page_recovered_by_whole_document_ocr_drops_the_earlier_ocr_error(monkey
         assert all(pg.status == "recovered" and pg.engine == "ocr" for pg in rep.pages)
     finally:
         os.unlink(path)
+
+
+def test_extraction_reports_are_isolated_per_thread(tmp_path):
+    import threading
+
+    folders = {}
+    for name in ("a", "b"):
+        folder = tmp_path / name
+        folder.mkdir()
+        _write_image(folder / f"{name}.png")
+        folders[name] = str(folder)
+    barrier = threading.Barrier(2, timeout=5)
+    extractor = TextExtractor(ocr_images=True)
+    extractor.ocr_handler = MagicMock()
+
+    def ocr(image):
+        barrier.wait()
+        return "TEXTO"
+
+    extractor.ocr_handler.extract_text_from_image.side_effect = ocr
+    seen = {}
+
+    done = threading.Barrier(2, timeout=5)
+
+    def worker(name):
+        extractor.extract_from_folder(folders[name])
+        done.wait()
+        seen[name] = (sorted(extractor.last_extraction_reports), extractor.last_extraction_report.path)
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert seen["a"] == (["a.png"], os.path.join(folders["a"], "a.png"))
+    assert seen["b"] == (["b.png"], os.path.join(folders["b"], "b.png"))
+    assert extractor.last_extraction_report is None
+    assert extractor.last_extraction_reports == {}
+
+
+def test_text_extractor_survives_pickle_without_its_thread_state(sample_txt_file):
+    import pickle
+
+    extractor = TextExtractor(ocr_handler=True)
+    extractor.last_extraction_reports = {"x.pdf": ExtractionReport(path="x.pdf")}
+
+    restored = pickle.loads(pickle.dumps(extractor))
+
+    assert restored.last_extraction_reports == {}
+    assert restored.last_extraction_report is None
+    assert "file_path_pwd" in restored.extract_from_file(sample_txt_file)
