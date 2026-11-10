@@ -1081,12 +1081,14 @@ class TextExtractor:
             ocr_by_page = self.ocr_handler.extract_text_from_pdf_page_indices(
                 file_path, sorted(ocr_worthy)
             )
+            ocr_failures = self._ocr_failures()
             for idx in sorted(ocr_worthy):
                 cand = ocr_by_page.get(idx, "")
                 if cand:
                     page_texts[idx] = cand
                     _mark(idx, RECOVERED, "ocr")
                     remaining.discard(idx)
+            self._mark_ocr_failures(report, ocr_failures)
 
         for idx in sorted(remaining):
             _mark(idx, CORRUPT_UNRECOVERABLE, "")
@@ -1101,6 +1103,21 @@ class TextExtractor:
             )
 
         return page_texts
+
+    def _ocr_failures(self) -> Dict[int, str]:
+        failures = getattr(self.ocr_handler, "last_failed_pages", None)
+        return dict(failures) if isinstance(failures, dict) else {}
+
+    @staticmethod
+    def _mark_ocr_failures(report: Optional[ExtractionReport], failures: Dict[int, str]) -> None:
+        if report is None:
+            return
+        for idx, reason in failures.items():
+            if 0 <= idx < len(report.pages):
+                page = report.pages[idx]
+                page.status = CORRUPT_UNRECOVERABLE
+                page.engine = ""
+                page.ocr_error = reason
 
     def _merge_page_texts(
         self, primary: List[str], secondary: List[str]
@@ -1210,6 +1227,7 @@ class TextExtractor:
                         if 0 <= idx < len(report.pages):
                             report.pages[idx].status = RECOVERED
                             report.pages[idx].engine = "ocr"
+                self._mark_ocr_failures(report, self._ocr_failures())
 
             page_texts = self._recover_glyph_garbage_pages(
                 file_path, page_texts, failed, report
@@ -1256,6 +1274,8 @@ class TextExtractor:
                     if pe.status in (CLEAN, CORRUPT_UNRECOVERABLE):
                         pe.status = RECOVERED
                         pe.engine = "ocr"
+                    pe.ocr_error = ""
+                self._mark_ocr_failures(report, self._ocr_failures())
                 report.recompute_overall()
                 if report.demote_to_clean_if_fully_ocr_recovered():
                     logger.info(
@@ -1370,6 +1390,7 @@ class TextExtractor:
                     index=index,
                     status=CLEAN if frame_text else CORRUPT_UNRECOVERABLE,
                     engine="ocr",
+                    ocr_error=self._ocr_failures().get(0, ""),
                 ))
                 if frame_text:
                     texts.append(frame_text)

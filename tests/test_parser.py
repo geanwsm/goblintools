@@ -1049,3 +1049,129 @@ def test_extract_from_folder_reads_files_in_stable_alphabetical_order(tmp_path):
     text = TextExtractor().extract_from_folder(str(tmp_path))
 
     assert text.index("ALFA") < text.index("BETA") < text.index("GAMA")
+
+
+_SCANNED_TEXT = (
+    "Contratacao de empresa para fornecimento de material de consumo conforme "
+    "termo de referencia. Valor total estimado dez mil reais. Pregao eletronico."
+)
+
+
+def test_whole_document_ocr_failure_is_reported_on_the_page(monkeypatch):
+    pytest.importorskip("reportlab")
+    import goblintools.parser as p
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        path = f.name
+    try:
+        _write_pdf_lines(path, _SCANNED_TEXT)
+        monkeypatch.setattr(p, "_substitution_cipher_score", lambda *a, **k: 0.25)
+        ex = TextExtractor()
+        ex.ocr_handler = MagicMock()
+        ex.ocr_handler.extract_text_from_pdf.return_value = ""
+        ex.ocr_handler.last_failed_pages = {0: "throttled"}
+
+        ex.extract_from_file(path)
+
+        rep = ex.last_extraction_report
+        assert rep.pages[0].status == "corrupt_unrecoverable"
+        assert rep.pages[0].engine == ""
+        assert rep.pages[0].ocr_error == "throttled"
+        assert rep.failed_ocr_pages == [0]
+        assert rep.overall_status != "clean"
+    finally:
+        os.unlink(path)
+
+
+def test_pypdf_failed_page_with_ocr_failure_is_reported():
+    pytest.importorskip("reportlab")
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        path = f.name
+    try:
+        _write_pdf_lines(path, _SCANNED_TEXT)
+        ex = TextExtractor()
+        ex.ocr_handler = MagicMock()
+        ex.ocr_handler.extract_text_from_pdf_page_indices.return_value = {}
+        ex.ocr_handler.last_failed_pages = {1: "throttled"}
+        with patch.object(ex, "_pypdf_extract_pages", return_value=([_SCANNED_TEXT, ""], {1}, False)):
+            ex.extract_from_file(path)
+
+        rep = ex.last_extraction_report
+        assert rep.failed_ocr_pages == [1]
+        assert rep.pages[1].ocr_error == "throttled"
+        assert rep.pages[0].ocr_error == ""
+    finally:
+        os.unlink(path)
+
+
+def test_text_layer_recovery_records_the_ocr_failure():
+    extractor = TextExtractor()
+    extractor.ocr_handler = MagicMock()
+    extractor.ocr_handler.extract_text_from_pdf_page_indices.return_value = {}
+    extractor.ocr_handler.last_failed_pages = {0: "rasterize"}
+    report = ExtractionReport(path="fake.pdf")
+    report.pages = [PageExtraction(index=0)]
+    garbage_page = " ".join(f"/{i}" for i in range(20))
+    plumber_garbage = "".join(f"(cid:{i})" for i in range(20))
+    with patch.object(extractor, "_pdfplumber_page_text", return_value={0: plumber_garbage}), \
+         patch.object(extractor, "_poppler_page_text", return_value={0: plumber_garbage}):
+        extractor._recover_glyph_garbage_pages("fake.pdf", [garbage_page], set(), report)
+
+    assert report.pages[0].status == "corrupt_unrecoverable"
+    assert report.pages[0].ocr_error == "rasterize"
+
+
+def test_mark_ocr_failures_flags_only_known_pages():
+    report = ExtractionReport(path="x.pdf")
+    report.pages = [PageExtraction(index=i, status="recovered", engine="ocr") for i in range(2)]
+
+    TextExtractor._mark_ocr_failures(report, {1: "rasterize", 5: "throttled"})
+    TextExtractor._mark_ocr_failures(None, {0: "throttled"})
+
+    assert (report.pages[0].status, report.pages[0].engine, report.pages[0].ocr_error) == ("recovered", "ocr", "")
+    assert (report.pages[1].status, report.pages[1].engine, report.pages[1].ocr_error) == ("corrupt_unrecoverable", "", "rasterize")
+
+
+def test_image_ocr_failure_is_reported_on_the_page(tmp_path):
+    path = _write_image(tmp_path / "certidao.png")
+    extractor = _extractor_with_ocr([""])
+    extractor.ocr_handler.last_failed_pages = {0: "throttled"}
+
+    extractor.extract_from_file(path)
+
+    report = extractor.last_extraction_report
+    assert report.pages[0].ocr_error == "throttled"
+    assert report.failed_ocr_pages == [0]
+
+
+def test_page_recovered_by_whole_document_ocr_drops_the_earlier_ocr_error(monkeypatch):
+    pytest.importorskip("reportlab")
+    import goblintools.parser as p
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        path = f.name
+    try:
+        _write_pdf_lines(path, _SCANNED_TEXT)
+        monkeypatch.setattr(p, "_substitution_cipher_score", lambda *a, **k: 0.25)
+        ex = TextExtractor()
+        handler = MagicMock()
+
+        def page_indices(path, indices):
+            handler.last_failed_pages = {1: "throttled"}
+            return {}
+
+        def whole_document(path):
+            handler.last_failed_pages = {}
+            return "TEXTO RECUPERADO VIA OCR"
+
+        handler.extract_text_from_pdf_page_indices.side_effect = page_indices
+        handler.extract_text_from_pdf.side_effect = whole_document
+        ex.ocr_handler = handler
+        with patch.object(ex, "_pypdf_extract_pages", return_value=([_SCANNED_TEXT, ""], {1}, False)):
+            ex.extract_from_file(path)
+
+        rep = ex.last_extraction_report
+        assert rep.failed_ocr_pages == []
+        assert all(pg.status == "recovered" and pg.engine == "ocr" for pg in rep.pages)
+    finally:
+        os.unlink(path)

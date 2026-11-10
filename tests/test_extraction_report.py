@@ -76,3 +76,29 @@ def test_no_demote_when_already_clean():
 def test_page_extraction_short_token_ratio_defaults_to_zero():
     """New field is additive with a neutral default — existing construction still works."""
     assert PageExtraction(index=0).short_token_ratio == 0.0
+
+
+def test_page_extraction_ocr_error_defaults_to_empty():
+    assert PageExtraction(index=0).ocr_error == ""
+    assert _report(CLEAN, RECOVERED).failed_ocr_pages == []
+
+
+def test_failed_ocr_pages_lists_pages_with_an_ocr_error():
+    r = ExtractionReport(path="x.pdf")
+    r.pages = [
+        PageExtraction(index=0, status=RECOVERED, engine="ocr"),
+        PageExtraction(index=1, status=CORRUPT_UNRECOVERABLE, engine="", ocr_error="throttled"),
+        PageExtraction(index=2, status=CORRUPT_UNRECOVERABLE, engine="", ocr_error="rasterize"),
+    ]
+    assert r.failed_ocr_pages == [1, 2]
+
+
+def test_scan_with_an_ocr_failure_is_never_demoted_to_clean():
+    r = ExtractionReport(path="x.pdf")
+    r.pages = [
+        PageExtraction(index=0, status=RECOVERED, engine="ocr"),
+        PageExtraction(index=1, status=CORRUPT_UNRECOVERABLE, engine="", ocr_error="throttled"),
+    ]
+    r.recompute_overall()
+    assert r.demote_to_clean_if_fully_ocr_recovered() is False
+    assert r.overall_status == OVERALL_PARTIALLY_RECOVERED

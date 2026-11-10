@@ -24,6 +24,7 @@ class PageExtraction:
     engine: str = "pypdf"          # pypdf | pdfplumber | poppler | ocr | ""
     broken_before: bool = False    # text layer looked broken before recovery
     short_token_ratio: float = 0.0  # whitespace-fragmentation score (0 clean/tabular, ~0.8 fragmented)
+    ocr_error: str = ""
 
 
 @dataclass
@@ -44,6 +45,10 @@ class ExtractionReport:
     @property
     def is_clean(self) -> bool:
         return self.overall_status == OVERALL_CLEAN
+
+    @property
+    def failed_ocr_pages(self) -> List[int]:
+        return [p.index for p in self.pages if p.ocr_error]
 
     def recompute_overall(self) -> None:
         statuses = {p.status for p in self.pages}
