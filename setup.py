@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="goblintools",
-    version="0.13.4",
+    version="0.14.0",
     packages=find_packages(exclude=["tests", "tests.*"]),
     install_requires=[
         "patool",

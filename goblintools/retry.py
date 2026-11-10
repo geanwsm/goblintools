@@ -1,7 +1,10 @@
 """Retry utility for transient failures."""
+import random
 import time
 import functools
-from typing import Tuple, Type
+from typing import Callable, Optional, Tuple, Type, TypeVar
+
+T = TypeVar("T")
 
 
 def retry_with_backoff(
@@ -28,3 +31,30 @@ def retry_with_backoff(
             raise last_exc
         return wrapper
     return decorator
+
+
+def retry_until_deadline(
+    func: Callable[[], T],
+    max_wait_s: float,
+    base_delay: float,
+    max_delay: float,
+    exceptions: Tuple[Type[Exception], ...],
+    sleep: Optional[Callable[[float], None]] = None,
+    clock: Optional[Callable[[], float]] = None,
+    rng: Optional[Callable[[], float]] = None,
+) -> T:
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    rng = rng or random.random
+    budget = max(0.0, float(max_wait_s))
+    start = clock()
+    attempt = 0
+    while True:
+        try:
+            return func()
+        except exceptions:
+            delay = min(max_delay, base_delay * (2 ** min(attempt, 30))) * rng()
+            if budget <= 0 or clock() - start + delay > budget:
+                raise
+            sleep(delay)
+            attempt += 1

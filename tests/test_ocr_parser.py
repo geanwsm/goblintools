@@ -82,9 +82,23 @@ def test_explicit_keys_and_session_token_reach_boto3():
     assert kwargs["aws_session_token"] == "TOKEN"
 
 
-@patch("goblintools.retry.time.sleep")
-def test_throttling_is_retried_then_succeeds(_sleep):
-    """A throttled page is retried instead of silently returning an empty page."""
+@pytest.fixture
+def fake_time(monkeypatch):
+    from goblintools import retry
+
+    state = {"now": 0.0, "slept": []}
+
+    def sleep(seconds):
+        state["slept"].append(seconds)
+        state["now"] += seconds
+
+    monkeypatch.setattr(retry.time, "sleep", sleep)
+    monkeypatch.setattr(retry.time, "monotonic", lambda: state["now"])
+    monkeypatch.setattr(retry.random, "random", lambda: 1.0)
+    return state
+
+
+def test_throttling_is_retried_then_succeeds(fake_time):
     client = MagicMock()
     client.detect_document_text.side_effect = [_client_error("ThrottlingException"), _lines_response("EDITAL")]
     processor = _processor_with_client(client)
@@ -95,9 +109,18 @@ def test_throttling_is_retried_then_succeeds(_sleep):
     assert client.detect_document_text.call_count == 2
 
 
-@patch("goblintools.retry.time.sleep")
-def test_transient_error_exhausted_returns_empty_with_warning(_sleep, caplog):
-    """After the retries run out the page is skipped with a warning, never an exception."""
+def test_throttling_that_clears_within_the_budget_is_not_dropped(fake_time):
+    client = MagicMock()
+    client.detect_document_text.side_effect = [_client_error("ThrottlingException")] * 5 + [_lines_response("EDITAL")]
+    processor = _processor_with_client(client)
+
+    text = processor._process_page_aws(np.zeros((20, 20, 3), dtype=np.uint8))
+
+    assert text == "EDITAL"
+    assert sum(fake_time["slept"]) <= processor.config.textract_max_wait_s
+
+
+def test_transient_error_exhausted_returns_empty_with_warning(fake_time, caplog):
     client = MagicMock()
     client.detect_document_text.side_effect = _client_error("ProvisionedThroughputExceededException")
     processor = _processor_with_client(client)
@@ -105,13 +128,23 @@ def test_transient_error_exhausted_returns_empty_with_warning(_sleep, caplog):
     text = processor._process_page_aws(np.zeros((20, 20, 3), dtype=np.uint8))
 
     assert text == ""
-    assert client.detect_document_text.call_count == 4
+    assert client.detect_document_text.call_count > 4
+    assert sum(fake_time["slept"]) <= processor.config.textract_max_wait_s
     assert "unavailable" in caplog.text.lower()
 
 
-@patch("goblintools.retry.time.sleep")
-def test_definitive_error_is_not_retried(sleep):
-    """AccessDenied will never succeed: one call, logged, empty page."""
+def test_max_wait_from_config_bounds_the_retries(fake_time):
+    client = MagicMock()
+    client.detect_document_text.side_effect = _client_error("ThrottlingException")
+    processor = OCRProcessor(OCRConfig(use_aws=True, use_default_aws_credentials=True, textract_max_wait_s=0))
+    processor._textract_client = client
+
+    assert processor._process_page_aws(np.zeros((20, 20, 3), dtype=np.uint8)) == ""
+    assert client.detect_document_text.call_count == 1
+    assert fake_time["slept"] == []
+
+
+def test_definitive_error_is_not_retried(fake_time):
     client = MagicMock()
     client.detect_document_text.side_effect = _client_error("AccessDeniedException")
     processor = _processor_with_client(client)
@@ -120,7 +153,7 @@ def test_definitive_error_is_not_retried(sleep):
 
     assert text == ""
     assert client.detect_document_text.call_count == 1
-    sleep.assert_not_called()
+    assert fake_time["slept"] == []
 
 
 def test_credentials_never_appear_in_logs(caplog):
@@ -316,15 +349,21 @@ def test_pdf_ocr_memory_peak_stays_low_for_a_50_page_scan(monkeypatch):
     assert peak < 300 * 1024 * 1024
 
 
-def test_textract_client_disables_botocore_retries():
-    """Retries live in goblintools only, so throttling does not multiply calls per page."""
+def test_textract_client_uses_adaptive_rate_limiting_without_botocore_retries():
     processor = OCRProcessor(OCRConfig(use_aws=True, use_default_aws_credentials=True))
     with patch("goblintools.ocr_parser.boto3.client") as client:
         processor.textract_client
     boto_config = client.call_args.kwargs["config"]
-    assert boto_config.retries == {"total_max_attempts": 1}
+    assert boto_config.retries == {"mode": "adaptive", "total_max_attempts": 1}
     assert boto_config.connect_timeout == 10
     assert boto_config.read_timeout == 60
+
+
+def test_real_textract_client_registers_the_adaptive_limiter():
+    config = OCRConfig(use_aws=True, aws_access_key="AKIA", aws_secret_key="SECRET")
+    client = OCRProcessor(config).textract_client
+    assert client.meta.config.retries["mode"] == "adaptive"
+    assert client.meta.config.retries["total_max_attempts"] == 1
 
 
 # --- Optional local OCR / Textract without OpenCV (0.13.0) --------------------

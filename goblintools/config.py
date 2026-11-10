@@ -21,6 +21,7 @@ class OCRConfig:
     # every page; set a cap to bound cost on huge scans (pages beyond it are skipped).
     pdf_ocr_dpi: int = 200
     max_ocr_pages: Optional[int] = None
+    textract_max_wait_s: float = 30.0
 
 @dataclass
 class ArchiveLimits:
