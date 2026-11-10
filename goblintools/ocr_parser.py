@@ -13,7 +13,7 @@ from PIL import Image
 from pypdf import PdfReader
 import multiprocessing
 from goblintools.config import OCRConfig
-from goblintools.retry import retry_with_backoff
+from goblintools.retry import retry_with_backoff, retry_until_deadline
 from goblintools.log_policy import log_warning
 
 logger = logging.getLogger(__name__)
@@ -30,6 +30,9 @@ _TEXTRACT_TRANSIENT_CODES = frozenset({
     "ServiceUnavailableException",
     "LimitExceededException",
 })
+
+_TEXTRACT_RETRY_BASE_DELAY = 0.5
+_TEXTRACT_RETRY_MAX_DELAY = 8.0
 
 
 def _pdf_page_count(pdf_path: str) -> int:
@@ -130,10 +133,8 @@ class OCRProcessor:
                     aws_secret_access_key=self.config.aws_secret_key,
                     aws_session_token=self.config.aws_session_token,
                 )
-            # Retries live in _textract_detect only; botocore's own retries would
-            # multiply calls per page under throttling.
             kwargs['config'] = BotoConfig(
-                retries={'total_max_attempts': 1},
+                retries={'mode': 'adaptive', 'total_max_attempts': 1},
                 connect_timeout=10,
                 read_timeout=60,
             )
@@ -159,8 +160,16 @@ class OCRProcessor:
             log_warning(logger, f"AWS Textract unavailable after retries ({e}); page skipped.")
             return ""
 
-    @retry_with_backoff(max_retries=3, initial_delay=0.5, exceptions=(TextractTransientError,))
     def _textract_detect(self, img_bytes: bytes) -> str:
+        return retry_until_deadline(
+            lambda: self._textract_detect_once(img_bytes),
+            max_wait_s=self.config.textract_max_wait_s,
+            base_delay=_TEXTRACT_RETRY_BASE_DELAY,
+            max_delay=_TEXTRACT_RETRY_MAX_DELAY,
+            exceptions=(TextractTransientError,),
+        )
+
+    def _textract_detect_once(self, img_bytes: bytes) -> str:
         try:
             response = self.textract_client.detect_document_text(Document={'Bytes': img_bytes})
         except ClientError as e:

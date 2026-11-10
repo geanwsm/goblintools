@@ -104,3 +104,14 @@ def test_local_ocr_dependencies_are_an_optional_extra():
     for name in ("opencv-python-headless", "scipy", "pytesseract"):
         assert name not in required
         assert name in extra
+
+
+def test_textract_max_wait_defaults_to_thirty_seconds():
+    assert OCRConfig().textract_max_wait_s == 30.0
+
+
+def test_textract_max_wait_keeps_positional_arguments_working():
+    config = OCRConfig(True, "key", "secret", "sa-east-1", "eng")
+    assert config.aws_region == "sa-east-1"
+    assert config.tesseract_lang == "eng"
+    assert config.textract_max_wait_s == 30.0

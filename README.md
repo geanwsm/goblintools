@@ -711,6 +711,10 @@ The PDF's font maps character codes to custom glyph names with no working `/ToUn
 
 ---
 
+## Release highlights (0.14.0)
+
+- **Textract throttling no longer drops pages after ~3.5 s**: `DetectDocumentText` calls now go through botocore's adaptive client-side rate limiter (`retries={'mode': 'adaptive', 'total_max_attempts': 1}`), so each client slows down when Textract throttles and ramps up again when it stops, and goblintools retries transient errors with exponential backoff and full jitter until a per-page deadline instead of three fixed attempts. The deadline is `OCRConfig.textract_max_wait_s` (default 30 s; `0` means a single attempt). **Behaviour change**: under sustained throttling a page can now take up to the deadline before it is skipped (previously ~3.5 s). There is still a single retry layer (botocore does not retry on its own). In a local simulation with a 25 req/s quota and 100 concurrent clients (`scripts/dev_textract_throttle_sim.py`), dropped pages went from 51% with the previous policy to 0.7%.
+
 ## Release highlights (0.13.4)
 
 - **Works with pypdf 6.20+**: pypdf 6.20 moved `Font` from `pypdf._font` to `pypdf.generic._font`, so `import goblintools` failed with `ModuleNotFoundError: No module named 'pypdf._font'` on any install that resolved pypdf 6.20 or newer. The pypdf workarounds now import `Font` from either location. Projects that pinned `pypdf<6.20` to work around it can drop the pin.
