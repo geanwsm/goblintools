@@ -214,7 +214,7 @@ def _page_image():
 def _aws_processor(**config_overrides):
     config = OCRConfig(use_aws=True, use_default_aws_credentials=True, **config_overrides)
     processor = OCRProcessor(config)
-    processor._process_page_aws = MagicMock(side_effect=lambda image: "pagina")
+    processor._process_page_aws_with_reason = MagicMock(side_effect=lambda image: ("pagina", ""))
     return processor
 
 
@@ -254,7 +254,7 @@ def test_pdf_ocr_has_no_page_cap_by_default(monkeypatch):
     monkeypatch.setattr(ocr_module, "convert_from_path", lambda path, **kw: calls.append(kw) or [_page_image()])
     monkeypatch.setattr(ocr_module, "_pdf_page_count", lambda path: 150)
     processor = _aws_processor()
-    processor._process_page_aws = lambda image: "pagina"
+    processor._process_page_aws_with_reason = lambda image: ("pagina", "")
 
     assert len(processor.extract_text_from_pdf_by_pages("scan.pdf")) == 150
     assert len(calls) == 150
@@ -337,7 +337,7 @@ def test_pdf_ocr_memory_peak_stays_low_for_a_50_page_scan(monkeypatch):
     monkeypatch.setattr(ocr_module, "_pdf_page_count", lambda path: 50)
     processor = _aws_processor()
     # A MagicMock would keep every page in call_args_list; use a plain function.
-    processor._process_page_aws = lambda image: "pagina"
+    processor._process_page_aws_with_reason = lambda image: ("pagina", "")
 
     tracemalloc.start()
     try:
@@ -431,3 +431,128 @@ def test_package_imports_and_parses_without_the_local_ocr_extra(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert "Declaração sem OCR local" in result.stdout
+
+
+def _pdf_pages(monkeypatch, count, failing_page=None):
+    def fake_convert(path, **kw):
+        if kw["first_page"] == failing_page:
+            raise RuntimeError("poppler crashed")
+        return [_page_image()]
+
+    monkeypatch.setattr(ocr_module, "convert_from_path", fake_convert)
+    monkeypatch.setattr(ocr_module, "_pdf_page_count", lambda path: count)
+
+
+def _textract_processor(client, **overrides):
+    processor = OCRProcessor(OCRConfig(use_aws=True, use_default_aws_credentials=True, **overrides))
+    processor._textract_client = client
+    return processor
+
+
+def test_new_processor_has_no_failed_pages():
+    assert OCRProcessor(OCRConfig()).last_failed_pages == {}
+
+
+def test_throttled_page_is_reported_in_last_failed_pages(monkeypatch):
+    _pdf_pages(monkeypatch, 2)
+    client = MagicMock()
+    client.detect_document_text.side_effect = [_lines_response("EDITAL"), _client_error("ThrottlingException")]
+    processor = _textract_processor(client, textract_max_wait_s=0)
+
+    assert processor.extract_text_from_pdf_by_pages("scan.pdf") == ["EDITAL", ""]
+    assert processor.last_failed_pages == {1: "throttled"}
+
+
+def test_rejected_page_reports_the_error_code(monkeypatch):
+    _pdf_pages(monkeypatch, 1)
+    client = MagicMock()
+    client.detect_document_text.side_effect = _client_error("AccessDeniedException")
+    processor = _textract_processor(client)
+
+    processor.extract_text_from_pdf_by_pages("scan.pdf")
+
+    assert processor.last_failed_pages == {0: "rejected:AccessDeniedException"}
+
+
+def test_page_too_large_for_textract_is_reported(monkeypatch):
+    _pdf_pages(monkeypatch, 1)
+    monkeypatch.setattr(ocr_module, "_encode_for_textract", lambda image: None)
+    client = MagicMock()
+    processor = _textract_processor(client)
+
+    processor.extract_text_from_pdf_by_pages("scan.pdf")
+
+    assert processor.last_failed_pages == {0: "too_large"}
+    client.detect_document_text.assert_not_called()
+
+
+def test_unexpected_textract_error_is_reported(monkeypatch):
+    _pdf_pages(monkeypatch, 1)
+    client = MagicMock()
+    client.detect_document_text.side_effect = RuntimeError("socket closed")
+    processor = _textract_processor(client)
+
+    assert processor.extract_text_from_pdf_by_pages("scan.pdf") == [""]
+    assert processor.last_failed_pages == {0: "error"}
+
+
+def test_page_that_fails_to_rasterize_is_reported(monkeypatch):
+    _pdf_pages(monkeypatch, 2, failing_page=2)
+    client = MagicMock()
+    client.detect_document_text.return_value = _lines_response("EDITAL")
+    processor = _textract_processor(client)
+
+    assert processor.extract_text_from_pdf_by_pages("scan.pdf") == ["EDITAL"]
+    assert processor.last_failed_pages == {1: "rasterize"}
+
+
+def test_selected_page_that_fails_to_rasterize_is_reported(monkeypatch):
+    _pdf_pages(monkeypatch, 3, failing_page=3)
+    client = MagicMock()
+    client.detect_document_text.return_value = _lines_response("EDITAL")
+    processor = _textract_processor(client)
+
+    assert processor.extract_text_from_pdf_page_indices("scan.pdf", [0, 2]) == {0: "EDITAL"}
+    assert processor.last_failed_pages == {2: "rasterize"}
+
+
+def test_selected_page_with_throttling_is_reported(monkeypatch):
+    _pdf_pages(monkeypatch, 2)
+    client = MagicMock()
+    client.detect_document_text.side_effect = [_client_error("ThrottlingException"), _lines_response("EDITAL")]
+    processor = _textract_processor(client, textract_max_wait_s=0)
+
+    assert processor.extract_text_from_pdf_page_indices("scan.pdf", [0, 1]) == {0: "", 1: "EDITAL"}
+    assert processor.last_failed_pages == {0: "throttled"}
+
+
+def test_blank_page_read_by_textract_is_not_a_failure(monkeypatch):
+    _pdf_pages(monkeypatch, 1)
+    client = MagicMock()
+    client.detect_document_text.return_value = _lines_response()
+    processor = _textract_processor(client)
+
+    assert processor.extract_text_from_pdf_by_pages("scan.pdf") == [""]
+    assert processor.last_failed_pages == {}
+
+
+def test_image_ocr_failure_is_reported_at_index_zero():
+    client = MagicMock()
+    client.detect_document_text.side_effect = _client_error("AccessDeniedException")
+    processor = _textract_processor(client)
+
+    assert processor.extract_text_from_image(np.zeros((20, 20, 3), dtype=np.uint8)) == ""
+    assert processor.last_failed_pages == {0: "rejected:AccessDeniedException"}
+
+
+def test_failed_pages_are_reset_on_every_call(monkeypatch):
+    _pdf_pages(monkeypatch, 1)
+    client = MagicMock()
+    client.detect_document_text.side_effect = [_client_error("ThrottlingException"), _lines_response("EDITAL")]
+    processor = _textract_processor(client, textract_max_wait_s=0)
+
+    processor.extract_text_from_pdf_by_pages("scan.pdf")
+    assert processor.last_failed_pages == {0: "throttled"}
+
+    processor.extract_text_from_pdf_by_pages("scan.pdf")
+    assert processor.last_failed_pages == {}

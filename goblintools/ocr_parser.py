@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import boto3
 import numpy as np
@@ -34,6 +34,12 @@ _TEXTRACT_TRANSIENT_CODES = frozenset({
 _TEXTRACT_RETRY_BASE_DELAY = 0.5
 _TEXTRACT_RETRY_MAX_DELAY = 8.0
 
+_OCR_FAILURE_THROTTLED = "throttled"
+_OCR_FAILURE_REJECTED = "rejected"
+_OCR_FAILURE_TOO_LARGE = "too_large"
+_OCR_FAILURE_RASTERIZE = "rasterize"
+_OCR_FAILURE_ERROR = "error"
+
 
 def _pdf_page_count(pdf_path: str) -> int:
     """Page count without rasterizing; 0 when it cannot be read (pages are then probed)."""
@@ -45,6 +51,10 @@ def _pdf_page_count(pdf_path: str) -> int:
 
 class TextractTransientError(Exception):
     """Transient Textract failure (throttling / 5xx), eligible for retry."""
+
+
+class TextractRejectedError(Exception):
+    pass
 
 
 def _encode_for_textract(image, max_bytes: int = TEXTRACT_SYNC_MAX_BYTES) -> Optional[bytes]:
@@ -86,6 +96,7 @@ class OCRProcessor:
     def __init__(self, config: OCRConfig):
         self.config = config
         self._textract_client = None
+        self.last_failed_pages: Dict[int, str] = {}
         has_keys = bool(config.aws_access_key and config.aws_secret_key)
         # Fall back to local OCR when use_aws=True but no credential source was chosen
         if config.use_aws and not has_keys and not config.use_default_aws_credentials:
@@ -147,18 +158,27 @@ class OCRProcessor:
         return self._textract_client
 
     def _process_page_aws(self, image):
+        return self._process_page_aws_with_reason(image)[0]
+
+    def _process_page_aws_with_reason(self, image) -> Tuple[str, str]:
         img_bytes = _encode_for_textract(image)
         if img_bytes is None:
             log_warning(
                 logger,
                 "Page image exceeds the Textract synchronous limit even after downscaling; page skipped.",
             )
-            return ""
+            return "", _OCR_FAILURE_TOO_LARGE
         try:
-            return self._textract_detect(img_bytes)
+            return self._textract_detect(img_bytes), ""
         except TextractTransientError as e:
             log_warning(logger, f"AWS Textract unavailable after retries ({e}); page skipped.")
-            return ""
+            return "", _OCR_FAILURE_THROTTLED
+        except TextractRejectedError as e:
+            log_warning(logger, f"AWS Textract rejected the page ({e}).")
+            return "", f"{_OCR_FAILURE_REJECTED}:{e}"
+        except Exception as e:
+            logger.error(f"Error during AWS Textract processing: {type(e).__name__}")
+            return "", _OCR_FAILURE_ERROR
 
     def _textract_detect(self, img_bytes: bytes) -> str:
         return retry_until_deadline(
@@ -176,11 +196,7 @@ class OCRProcessor:
             code = e.response.get('Error', {}).get('Code', '')
             if code in _TEXTRACT_TRANSIENT_CODES:
                 raise TextractTransientError(code) from e
-            log_warning(logger, f"AWS Textract rejected the page ({code or 'unknown error'}).")
-            return ""
-        except Exception as e:
-            logger.error(f"Error during AWS Textract processing: {type(e).__name__}")
-            return ""
+            raise TextractRejectedError(code or 'unknown error') from e
         return '\n'.join(
             item['Text']
             for item in response.get('Blocks', [])
@@ -189,9 +205,13 @@ class OCRProcessor:
 
     def extract_text_from_image(self, image) -> str:
         """OCR one in-memory image (PIL image or ndarray) with the configured engine."""
+        self.last_failed_pages = {}
         try:
             if self._use_aws_effective:
-                return (self._process_page_aws(np.asarray(image)) or "").strip()
+                text, reason = self._process_page_aws_with_reason(np.asarray(image))
+                if reason:
+                    self.last_failed_pages[0] = reason
+                return (text or "").strip()
             if not self._local_ocr_available():
                 return ""
             return (self._process_page_local(image) or "").strip()
@@ -254,6 +274,7 @@ class OCRProcessor:
                 logger.warning("OCR skip page %s of %s: %s", page_number - 1, pdf_path, e)
                 if not page_count:
                     return
+                self.last_failed_pages[page_number - 1] = _OCR_FAILURE_RASTERIZE
                 continue
             if not images:
                 return
@@ -264,11 +285,15 @@ class OCRProcessor:
 
     def extract_text_from_pdf_by_pages(self, pdf_path: str) -> List[str]:
         """Extract text from PDF returning a list of pages"""
+        self.last_failed_pages = {}
         if self._use_aws_effective:
-            return [
-                self._process_page_aws(np.array(image)) or ""
-                for _, image in self._iter_page_images(pdf_path)
-            ]
+            pages: List[str] = []
+            for index, image in self._iter_page_images(pdf_path):
+                text, reason = self._process_page_aws_with_reason(np.array(image))
+                if reason:
+                    self.last_failed_pages[index] = reason
+                pages.append(text or "")
+            return pages
 
         if not self._local_ocr_available():
             return []
@@ -297,6 +322,7 @@ class OCRProcessor:
     ) -> Dict[int, str]:
         """OCR only selected 0-based pages (e.g. PyPDF failures). Skips invalid indices."""
         out: Dict[int, str] = {}
+        self.last_failed_pages = {}
         if not self._use_aws_effective and not self._local_ocr_available():
             return out
         for idx in page_indices:
@@ -311,12 +337,16 @@ class OCRProcessor:
                 )
             except Exception as e:
                 logger.warning("OCR skip page %s of %s: %s", idx, pdf_path, e)
+                self.last_failed_pages[idx] = _OCR_FAILURE_RASTERIZE
                 continue
             if not images:
+                self.last_failed_pages[idx] = _OCR_FAILURE_RASTERIZE
                 continue
             image = images[0]
             if self._use_aws_effective:
-                text = self._process_page_aws(np.array(image))
+                text, reason = self._process_page_aws_with_reason(np.array(image))
+                if reason:
+                    self.last_failed_pages[idx] = reason
             else:
                 text = self._process_page_local(image)
             out[idx] = (text or "").strip()
