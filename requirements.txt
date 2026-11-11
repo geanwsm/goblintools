@@ -1,7 +1,7 @@
 boto3
 unidecode
 python-pptx
-pypdf>=6.15.0
+pypdf>=6.15.0,<8
 pdfplumber
 cryptography>=3.1
 beautifulsoup4

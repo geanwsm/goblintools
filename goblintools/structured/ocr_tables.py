@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from goblintools.pypdf_workarounds import with_relaxed_pypdf_limits
 from goblintools.structured.models import TableBlock
 from goblintools.structured.quality import prepare_rows_for_output, score_table
 from goblintools.table_extractor import normalize_table_rows
@@ -23,6 +24,7 @@ _MIN_TEXT_CHARS_PER_PAGE = 40
 _Y_TOLERANCE_RATIO = 0.015  # relative to page height for row clustering
 
 
+@with_relaxed_pypdf_limits
 def pdf_text_density(pdf_path: str, *, max_pages: Optional[int] = None) -> Tuple[int, int, float]:
     """Return ``(pages, total_chars, chars_per_page)`` via pypdf."""
     try:

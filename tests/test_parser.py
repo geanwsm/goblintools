@@ -265,6 +265,95 @@ def test_pypdf_workarounds_modern_patches_font_width():
     assert Font.get_text_width.__module__ == "goblintools.pypdf_workarounds"
 
 
+def _array_stream_cap():
+    from pypdf import get_configuration
+
+    return get_configuration().array_based_stream_maximum_output_length
+
+
+def test_pypdf_workarounds_leave_legacy_stream_cap_untouched_on_configuration_api():
+    """pypdf 7 raises on every PdfReader if the legacy MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH changed."""
+    import pypdf.filters as pypdf_filters
+    from goblintools.pypdf_workarounds import (
+        _configuration_api,
+        apply_pypdf_extraction_workarounds,
+    )
+
+    if _configuration_api() is None:
+        pytest.skip("pypdf without the Configuration API")
+    legacy_default = getattr(pypdf_filters, "MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH", None)
+
+    apply_pypdf_extraction_workarounds(force=True)
+
+    assert getattr(pypdf_filters, "MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH", None) == legacy_default
+
+
+def test_relaxed_pypdf_limits_raise_the_array_stream_cap_only_inside_the_block():
+    """relaxed_pypdf_limits lifts the array-based stream cap and restores it on exit."""
+    from goblintools.pypdf_workarounds import (
+        STREAM_OUTPUT_CAP,
+        _configuration_api,
+        relaxed_pypdf_limits,
+    )
+
+    if _configuration_api() is None:
+        pytest.skip("pypdf without the Configuration API")
+    before = _array_stream_cap()
+
+    with relaxed_pypdf_limits():
+        inside = _array_stream_cap()
+
+    assert inside == max(before, STREAM_OUTPUT_CAP)
+    assert _array_stream_cap() == before
+
+
+def test_pdf_extraction_uses_relaxed_limits_in_a_fresh_worker_thread(tmp_path):
+    """Worker threads start with pypdf's default context, so the limits must be applied per call."""
+    import threading
+
+    from goblintools import parser as parser_module
+    from goblintools.pypdf_workarounds import STREAM_OUTPUT_CAP, _configuration_api
+
+    if _configuration_api() is None:
+        pytest.skip("pypdf without the Configuration API")
+    pdf_path = tmp_path / "edital.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    with open(pdf_path, "wb") as fh:
+        writer.write(fh)
+    seen_caps = []
+    real_reader = parser_module.PdfReader
+
+    def recording_reader(*args, **kwargs):
+        seen_caps.append(_array_stream_cap())
+        return real_reader(*args, **kwargs)
+
+    with patch.object(parser_module, "PdfReader", side_effect=recording_reader):
+        worker = threading.Thread(
+            target=TextExtractor(ocr_handler=False).extract_from_file, args=(str(pdf_path),)
+        )
+        worker.start()
+        worker.join()
+
+    assert seen_caps
+    assert all(cap >= STREAM_OUTPUT_CAP for cap in seen_caps)
+
+
+def test_pypdf_workarounds_patch_legacy_stream_cap_without_configuration_api(monkeypatch):
+    """Older pypdf (no Configuration API) still gets the cap through the legacy constant."""
+    import pypdf.filters as pypdf_filters
+    from goblintools import pypdf_workarounds
+
+    monkeypatch.setattr(pypdf_workarounds, "_configuration_api", lambda: None)
+    monkeypatch.setattr(pypdf_filters, "MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH", 75_000_000, raising=False)
+
+    pypdf_workarounds.apply_pypdf_extraction_workarounds(force=True)
+    with pypdf_workarounds.relaxed_pypdf_limits():
+        patched = pypdf_filters.MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH
+
+    assert patched == pypdf_workarounds.STREAM_OUTPUT_CAP
+
+
 def test_merge_page_texts_prefers_primary_then_secondary():
     """_merge_page_texts keeps primary when present and fills blanks from secondary."""
     extractor = TextExtractor()
