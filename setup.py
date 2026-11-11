@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="goblintools",
-    version="0.15.1",
+    version="0.15.2",
     packages=find_packages(exclude=["tests", "tests.*"]),
     install_requires=[
         "patool",
@@ -10,7 +10,7 @@ setup(
         "boto3",
         "numpy",
         "pdf2image",
-        "pypdf>=6.15.0",
+        "pypdf>=6.15.0,<8",
         "pdfplumber",
         "cryptography>=3.1",
         "beautifulsoup4",

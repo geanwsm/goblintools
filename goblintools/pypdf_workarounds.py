@@ -3,7 +3,13 @@ Runtime fixes for pypdf text extraction.
 
 Goals:
 - Resolve font metrics stored as IndirectObject (space/character widths).
-- Relax array-based stream output cap when the attribute exists.
+- Relax the array-based stream output cap. pypdf with the ``Configuration`` API
+  (6.18+, mandatory from 7.0) keeps it in a ``ContextVar``: it is applied per call
+  by :func:`relaxed_pypdf_limits` / :func:`with_relaxed_pypdf_limits`, because
+  worker threads start from pypdf's default context, and the legacy
+  ``MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH`` must stay untouched — pypdf 7 raises
+  ``DeprecationError`` on every ``PdfReader`` when it differs from the default.
+  Older pypdf gets the cap through that legacy constant.
 - Stay compatible across pypdf generations:
 
   * **Legacy** (e.g. 6.12.x): ``CUSTOM_RTL_MIN`` is ``int``, Font has ``text_width``.
@@ -21,9 +27,52 @@ Apply once via :func:`apply_pypdf_extraction_workarounds`.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional, Union
+import functools
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator, Optional, Tuple, TypeVar, Union
+
+STREAM_OUTPUT_CAP = 120_000_000
 
 _applied = False
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def _configuration_api() -> Optional[Tuple[Callable[..., Any], Callable[[], Any]]]:
+    """Return pypdf's ``(apply_configuration, get_configuration)`` or None on older pypdf."""
+    try:
+        from pypdf import apply_configuration, get_configuration
+    except ImportError:
+        return None
+    if not hasattr(get_configuration(), "array_based_stream_maximum_output_length"):
+        return None
+    return apply_configuration, get_configuration
+
+
+@contextmanager
+def relaxed_pypdf_limits() -> Iterator[None]:
+    """Raise pypdf's array-based stream output cap for the current context (thread)."""
+    api = _configuration_api()
+    if api is None:
+        yield
+        return
+    apply_configuration, get_configuration = api
+    current = get_configuration().array_based_stream_maximum_output_length
+    with apply_configuration(
+        array_based_stream_maximum_output_length=max(current, STREAM_OUTPUT_CAP)
+    ):
+        yield
+
+
+def with_relaxed_pypdf_limits(func: _F) -> _F:
+    """Decorator running ``func`` inside :func:`relaxed_pypdf_limits`."""
+
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        with relaxed_pypdf_limits():
+            return func(*args, **kwargs)
+
+    return wrapper  # type: ignore[return-value]
 
 
 def _as_float(value: Any, fallback: float = 500.0) -> float:
@@ -74,16 +123,17 @@ def apply_pypdf_extraction_workarounds(*, force: bool = False) -> None:
     if _applied and not force:
         return
 
-    import pypdf.filters as pypdf_filters
+    if _configuration_api() is None:
+        import pypdf.filters as pypdf_filters
 
-    # Not every pypdf release exposes this on pypdf.filters (AttributeError-safe).
-    _stream_cap = getattr(
-        pypdf_filters, "MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH", None
-    )
-    if _stream_cap is not None:
-        pypdf_filters.MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH = max(
-            int(_stream_cap), 120_000_000
+        # Not every pypdf release exposes this on pypdf.filters (AttributeError-safe).
+        _stream_cap = getattr(
+            pypdf_filters, "MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH", None
         )
+        if _stream_cap is not None:
+            pypdf_filters.MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH = max(
+                int(_stream_cap), STREAM_OUTPUT_CAP
+            )
 
     if _uses_legacy_rtl_api():
         _apply_legacy_text_extraction_patches()

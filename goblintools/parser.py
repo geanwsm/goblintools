@@ -16,7 +16,7 @@ from pptx import Presentation
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import IndirectObject
 
-from goblintools.pypdf_workarounds import apply_pypdf_extraction_workarounds
+from goblintools.pypdf_workarounds import apply_pypdf_extraction_workarounds, with_relaxed_pypdf_limits
 
 apply_pypdf_extraction_workarounds()
 import openpyxl
@@ -764,6 +764,7 @@ class TextExtractor(ThreadLocalStateMixin):
         """
         return extract_pdf_tables(file_path, max_pages=max_pages)
 
+    @with_relaxed_pypdf_limits
     def pdf_needs_ocr(self, file_path: str) -> bool:
         """Check if PDF needs OCR processing"""
         try:
@@ -814,6 +815,7 @@ class TextExtractor(ThreadLocalStateMixin):
             xobject[obj].get("/Subtype") == "/Image" for obj in xobject
         )
 
+    @with_relaxed_pypdf_limits
     def _pypdf_extract_pages(
         self, pdf_path: str
     ) -> Tuple[List[str], Set[int], bool]:
@@ -1130,6 +1132,7 @@ class TextExtractor(ThreadLocalStateMixin):
         failed = {i for i, t in enumerate(merged) if not (t and t.strip())}
         return merged, failed
 
+    @with_relaxed_pypdf_limits
     def _resave_pdf(self, file_path: str) -> str:
         """Resave PDF to fix potential xref/stream issues (used as second attempt)."""
         reader = PdfReader(file_path)
@@ -1166,6 +1169,7 @@ class TextExtractor(ThreadLocalStateMixin):
         return results
 
     # Individual parser methods
+    @with_relaxed_pypdf_limits
     def _extract_pdf(self, file_path: str) -> str:
         """PyPDF text; resave retry; pdfplumber/poppler/OCR recovery for broken text
         layers; per-page OCR for gaps when a handler is set."""

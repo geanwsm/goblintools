@@ -15,6 +15,7 @@ import multiprocessing
 from goblintools.config import OCRConfig
 from goblintools.retry import retry_with_backoff, retry_until_deadline
 from goblintools.log_policy import log_warning
+from goblintools.pypdf_workarounds import with_relaxed_pypdf_limits
 from goblintools.thread_state import ThreadLocalAttribute, ThreadLocalStateMixin
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,7 @@ _OCR_FAILURE_RASTERIZE = "rasterize"
 _OCR_FAILURE_ERROR = "error"
 
 
+@with_relaxed_pypdf_limits
 def _pdf_page_count(pdf_path: str) -> int:
     """Page count without rasterizing; 0 when it cannot be read (pages are then probed)."""
     try:

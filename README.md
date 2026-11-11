@@ -16,7 +16,7 @@ goblintools/
 ├── parser.py             # TextExtractor - main extraction, format parsers, broken-text-layer recovery
 ├── table_extractor.py    # PDF table detection (pdfplumber), Markdown, quality filters
 ├── structured/           # Parallel StructuredExtractor (HTML tables + quality gate)
-├── pypdf_workarounds.py  # PyPDF monkey-patches (indirect font metrics, optional stream cap)
+├── pypdf_workarounds.py  # PyPDF monkey-patches (indirect font metrics) and stream cap (per-call Configuration on pypdf 6.18+)
 ├── ptbr_words.py         # Embedded PT-BR wordlist helpers (broken-text-layer corroboration)
 ├── extraction_report.py  # ExtractionReport / PageExtraction - per-page extraction provenance
 ├── file_handling.py      # FileManager, ArchiveHandler, FileValidator
@@ -32,7 +32,7 @@ goblintools/
 
 1. **Text extraction**: File → parser by extension; if unknown or **no extension**, magic-byte sniffing (PDF, RTF, Office Open XML) → extracted text (with `file_path_pwd` tag)
 2. **Folder extraction**: Each file’s tag uses the **path relative to the folder** (as inside a zip), e.g. `edital/arquivo.pdf` not the full filesystem path
-3. **PDF text**: [pypdf](https://pypi.org/project/pypdf/) (≥ 6.15.0) with built-in workarounds for common producer bugs (e.g. font widths as indirect references). The reader tries the file as-is, merges text from an internal resave when some pages fail, then uses plain and layout extraction modes. Pages whose text turns out to be a **broken text layer** — glyph-code garbage *or* a per-glyph substitution cipher that still looks word-shaped (see below) — are retried with **pdfplumber → poppler `pdftotext` → per-page OCR**. A per-call `TextExtractor.last_extraction_report` records what happened to each page. **Optional OCR** (`ocr_handler=True`): full-document OCR when the PDF has images but almost no text or the whole text layer is a cipher, or **per-page OCR** for pages the text engines cannot decode (requires Poppler for `pdf2image` and Tesseract for local OCR)
+3. **PDF text**: [pypdf](https://pypi.org/project/pypdf/) (≥ 6.15.0, < 8) with built-in workarounds for common producer bugs (e.g. font widths as indirect references). The reader tries the file as-is, merges text from an internal resave when some pages fail, then uses plain and layout extraction modes. Pages whose text turns out to be a **broken text layer** — glyph-code garbage *or* a per-glyph substitution cipher that still looks word-shaped (see below) — are retried with **pdfplumber → poppler `pdftotext` → per-page OCR**. A per-call `TextExtractor.last_extraction_report` records what happened to each page. **Optional OCR** (`ocr_handler=True`): full-document OCR when the PDF has images but almost no text or the whole text layer is a cipher, or **per-page OCR** for pages the text engines cannot decode (requires Poppler for `pdf2image` and Tesseract for local OCR)
 4. **PDF tables** (opt-in on `TextExtractor`): with `extract_tables=True`, [pdfplumber](https://pypi.org/project/pdfplumber/) detects tables on each page; the library filters one-column text boxes, collapses split headers, merges continuation rows, and appends Markdown tables after that page’s text (or returns structured matrices via `extract_tables_from_pdf`)
 5. **Structured extraction** (parallel API): `StructuredExtractor` extracts item-oriented tables from PDF / XLSX / CSV / DOCX into matrices + quality scores, and can render MinerU-compatible `full.md` with HTML `<table>` blocks — **without changing** plain `TextExtractor` behaviour
 6. **Archive extraction**: Format handler → extract to temp → flatten with stable names (extensionless entries preserved) → optionally remove source. Misnamed archives (e.g. `.zip` that is a PDF) use **magic-byte fallbacks**
@@ -51,7 +51,7 @@ Local OCR's Python dependencies (~300 MB, mostly OpenCV and SciPy) are an option
 ## Requirements
 
 - **Python**: 3.9 or newer
-- **pypdf**: 6.15.0 or newer (declared in package metadata; used for PDF text extraction)
+- **pypdf**: 6.15.0 or newer, below 8 (declared in package metadata; used for PDF text extraction)
 - **pdfplumber**: Used for optional PDF table detection (`extract_tables=True` / `extract_tables_from_pdf`) and as a recovery engine for broken text layers
 - **Tesseract OCR**: Required for local OCR support, together with the `local-ocr` extra ([Installation Guide](https://github.com/tesseract-ocr/tesseract))
   - **Portuguese Language Pack**: Install `tesseract-ocr-por` for Portuguese text recognition
@@ -62,7 +62,7 @@ Local OCR's Python dependencies (~300 MB, mostly OpenCV and SciPy) are an option
 ### PDF extraction notes
 
 - Importing `TextExtractor` applies **pypdf workarounds** once (idempotent): on older pypdf, safer `/Widths` / `space_width` handling; on pypdf 6.15+ the stock text extractor is kept (legacy monkey-patches would break RTL helpers) and only light font-width guards are applied.
-- If your pypdf build exposes `MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH` on `pypdf.filters`, the library increases that limit slightly so very large but legitimate content streams can still be decoded; if the attribute is missing (some forks or versions), that step is skipped automatically.
+- The library raises pypdf's array-based stream output limit to 120 MB so very large but legitimate content streams can still be decoded. On pypdf with the `Configuration` API (6.18+, required from 7.0) the limit is applied with `pypdf.apply_configuration` around each PDF read, in the calling thread — the legacy `MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH` constant is left untouched, since pypdf 7 refuses to open any PDF when it was changed. Older pypdf gets the limit through that constant; if it is missing (some forks), the step is skipped.
 - For scanned PDFs or pages with no usable text layer, enable **`TextExtractor(ocr_handler=True)`** and install Poppler + Tesseract.
 - Table extraction targets **native (digital) PDFs** with a text layer and visible table structure. Scanned pages need OCR first; table detection from scans (Textract TABLES / img2table) is not wired yet.
 - **Broken font encoding (non-scanned PDFs)**: some PDFs use a font `/Encoding` with a `/Differences` array mapping character codes to non-standard glyph names, with no working `/ToUnicode` CMap. Neither pypdf nor pdfminer can recover real characters from that — the mapping genuinely isn't in the file, even though the PDF renders correctly in any viewer (rendering uses the embedded font program directly, not this metadata). The library detects the resulting garbage in three ways:
@@ -710,6 +710,10 @@ The PDF's font maps character codes to custom glyph names with no working `/ToUn
 - **Out of scope**: Real-time streaming, document conversion to other formats, indexing/search, web scraping. OCR requires Tesseract (local) or AWS credentials (cloud). Table extraction from pure scans (Textract TABLES / img2table) is not included yet. Acting on `last_extraction_report` (e.g. writing `null` instead of a wrong value) is the consumer's responsibility.
 
 ---
+
+## Release highlights (0.15.2)
+
+- **Works with pypdf 7**: goblintools changed the legacy `pypdf.filters.MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH` on import, and pypdf 7.0 raises `DeprecationError` on every `PdfReader` when that constant differs from its default, so **every PDF failed to open** (empty text, `Failed to open PDF ... MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH is deprecated and was removed in pypdf 7.0.0`). On pypdf with the `Configuration` API the 120 MB stream cap is now applied per PDF read with `pypdf.apply_configuration`, which also reaches worker threads (they start from pypdf's default context); older pypdf keeps the legacy constant. pypdf is now declared as `>=6.15.0,<8`. Projects that pinned `pypdf<7` to work around it can drop the pin.
 
 ## Release highlights (0.15.1)
 
