@@ -87,6 +87,17 @@ For complete archive format support, install these system tools (required by `pa
 | **Arch Linux** | `sudo pacman -S unrar p7zip` |
 | **macOS** | `brew install unrar p7zip` |
 
+### Word 97–2003 (.doc)
+`.doc` files are read with [antiword](https://packages.debian.org/stable/antiword), called with UTF-8 output (`-m UTF-8.txt`), a 60 s timeout and a 64 MB output cap.
+
+| OS | Command |
+|----|---------|
+| **Debian/Ubuntu** | `sudo apt install antiword` |
+| **Arch Linux** | `sudo pacman -S antiword` |
+| **macOS** | `brew install antiword` |
+
+Without it, `.doc` files return no text and a single warning is logged per extractor.
+
 ### Tesseract OCR with Portuguese Support
 
 | OS | Command |
@@ -547,7 +558,9 @@ extractor_multi = TextExtractor(ocr_handler=True, config=multi_config)
 ## Supported Formats
 
 ### Documents
-`.pdf`, `.docx`, `.odt`, `.rtf`, `.txt`, `.csv`, `.xml`, `.html`
+`.pdf`, `.doc`, `.docx`, `.odt`, `.rtf`, `.txt`, `.csv`, `.xml`, `.html`
+
+`.doc` (Word 97–2003) needs the `antiword` binary (see [System Dependencies](#system-dependencies)). A `.doc` whose content is actually RTF or DOCX is read with the matching extractor.
 
 ### Spreadsheets
 `.xlsx`, `.xls`, `.ods`, `.dbf`
@@ -710,6 +723,10 @@ The PDF's font maps character codes to custom glyph names with no working `/ToUn
 - **Out of scope**: Real-time streaming, document conversion to other formats, indexing/search, web scraping. OCR requires Tesseract (local) or AWS credentials (cloud). Table extraction from pure scans (Textract TABLES / img2table) is not included yet. Acting on `last_extraction_report` (e.g. writing `null` instead of a wrong value) is the consumer's responsibility.
 
 ---
+
+## Release highlights (0.16.0)
+
+- **Word 97–2003 `.doc` support**: `.doc` files used to return empty text ("No parser available"), so a bidding notice shipped only as `.doc` produced no content. They are now read with the `antiword` binary, with UTF-8 output so Portuguese accents survive, a 60 s timeout and a 64 MB output cap; a failure, timeout or oversized output returns empty text with a warning instead of raising. A `.doc` whose content is actually RTF or DOCX (a common rename) is routed by content to the RTF or DOCX extractor. Without `antiword` on `PATH`, `.doc` files return empty text and a single warning is logged per extractor. `.doc` is also a parseable document for `FileManager` now, so it is copied out of archives like `.docx`.
 
 ## Release highlights (0.15.2)
 

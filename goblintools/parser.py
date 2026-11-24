@@ -159,6 +159,10 @@ _POPPLER_MAX_PAGE_BYTES = 8_000_000
 _POPPLER_DOC_TIMEOUT_CAP = 300
 _POPPLER_MAX_DOC_BYTES = 64_000_000
 
+_ANTIWORD_TIMEOUT = 60
+_ANTIWORD_MAX_BYTES = 64_000_000
+_OLE2_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
 # Standalone images (OCR only, opt-in via TextExtractor(ocr_images=True)).
 # Frame cap bounds OCR cost on hostile multi-page TIFFs.
 _IMAGE_MAX_FRAMES = 100
@@ -642,6 +646,7 @@ class TextExtractor(ThreadLocalStateMixin):
         """Initialize all available text extraction parsers."""
         return {
             '.pdf': self._extract_pdf,
+            '.doc': self._extract_doc,
             '.docx': self._extract_docx,
             '.txt': self._extract_txt,
             '.pptx': self._extract_pptx,
@@ -1398,6 +1403,57 @@ class TextExtractor(ThreadLocalStateMixin):
                     texts.append(frame_text)
         report.recompute_overall()
         return "\n\n".join(texts)
+
+    def _extract_doc(self, file_path: str) -> str:
+        try:
+            with open(file_path, 'rb') as f:
+                header = f.read(len(_OLE2_MAGIC))
+        except OSError as e:
+            log_warning(logger, f"Could not read DOC file {file_path}: {e}")
+            return ""
+        if header == _OLE2_MAGIC:
+            return self._antiword_text(file_path)
+        detected = FileValidator.detect_extension_from_magic(file_path)
+        if detected == '.rtf':
+            return self._extract_rtf(file_path)
+        if detected == '.docx':
+            return self._extract_docx(file_path)
+        log_warning(
+            logger,
+            f"DOC file {file_path} is not Word 97-2003, RTF or DOCX content; skipping.",
+        )
+        return ""
+
+    def _antiword_text(self, file_path: str) -> str:
+        exe = shutil.which("antiword")
+        if not exe:
+            if not getattr(self, "_antiword_warned", False):
+                log_warning(
+                    logger,
+                    "antiword not found on PATH; Word 97-2003 .doc files return no text.",
+                )
+                self._antiword_warned = True
+            return ""
+        try:
+            proc = subprocess.run(
+                [exe, "-m", "UTF-8.txt", "--", file_path],
+                capture_output=True,
+                timeout=_ANTIWORD_TIMEOUT,
+                check=False,
+            )
+        except (subprocess.SubprocessError, OSError) as e:
+            log_warning(logger, f"antiword failed for {file_path}: {e}")
+            return ""
+        if proc.returncode != 0:
+            log_warning(logger, f"antiword exited {proc.returncode} for {file_path}")
+            return ""
+        if len(proc.stdout) > _ANTIWORD_MAX_BYTES:
+            log_warning(
+                logger,
+                f"antiword output for {file_path} exceeds {_ANTIWORD_MAX_BYTES} bytes; discarding.",
+            )
+            return ""
+        return proc.stdout.decode("utf-8", "replace")
 
     def _extract_docx(self, file_path: str) -> str:
         """Extract text from DOCX files."""
