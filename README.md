@@ -562,6 +562,8 @@ extractor_multi = TextExtractor(ocr_handler=True, config=multi_config)
 
 `.doc` (Word 97–2003) needs the `antiword` binary (see [System Dependencies](#system-dependencies)). A `.doc` whose content is actually RTF or DOCX is read with the matching extractor.
 
+Files with no extension or an unknown one (for example `EDITAL` or `anexo.bin`) are recognised by content: PDF, RTF, images, ZIP, DOCX, Word 97–2003 (`.doc`) and Excel 97–2003 (`.xls`). `FileManager` copies them with the detected extension; anything else is skipped with a warning.
+
 ### Spreadsheets
 `.xlsx`, `.xls`, `.ods`, `.dbf`
 
@@ -727,6 +729,7 @@ The PDF's font maps character codes to custom glyph names with no working `/ToUn
 ## Release highlights (0.16.0)
 
 - **Word 97–2003 `.doc` support**: `.doc` files used to return empty text ("No parser available"), so a bidding notice shipped only as `.doc` produced no content. They are now read with the `antiword` binary, with UTF-8 output so Portuguese accents survive, a 60 s timeout and a 64 MB output cap; a failure, timeout or oversized output returns empty text with a warning instead of raising. A `.doc` whose content is actually RTF or DOCX (a common rename) is routed by content to the RTF or DOCX extractor. Without `antiword` on `PATH`, `.doc` files return empty text and a single warning is logged per extractor. `.doc` is also a parseable document for `FileManager` now, so it is copied out of archives like `.docx`.
+- **Files without a known extension are no longer dropped**: `FileManager.extract_files_recursive` only checked the content of a file with an archive extension, so a PDF saved without extension (or as `.bin`) returned `False` silently and never reached the extractor. Content detection now applies to any file without a known document extension: PDF, RTF and images are copied with the detected extension, a ZIP is opened by its signature even where `patool` cannot identify it (it relies on the `file` command, missing from slim container images), DOCX keeps working, and Word/Excel 97–2003 (OLE2) files are told apart by their internal streams (read with `xlrd`, already a dependency) and copied as `.doc` or `.xls`. A file whose type cannot be recognised is still skipped, now with a warning. Files with a known extension follow the same path as before.
 
 ## Release highlights (0.15.2)
 
