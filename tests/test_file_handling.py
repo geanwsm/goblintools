@@ -237,6 +237,11 @@ def test_images_are_parseable_documents():
         assert suffix in FileValidator.PARSEABLE_EXTENSIONS
 
 
+def test_doc_is_parseable_document():
+    assert ".doc" in FileValidator.PARSEABLE_EXTENSIONS
+    assert FileValidator.is_parseable_document("edital.DOC")
+
+
 # --- Archive limits (0.12.0) ---------------------------------------------------
 
 import io

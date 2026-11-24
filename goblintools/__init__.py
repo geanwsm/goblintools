@@ -24,4 +24,4 @@ __all__ = [
     'ArchiveLimits', 'ExtractionBudget',
     'extract_from_bytes', 'BytesExtractionResult',
 ]
-__version__ = '0.15.2'
+__version__ = '0.16.0'

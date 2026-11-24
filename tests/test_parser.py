@@ -1,6 +1,9 @@
 """Tests for TextExtractor."""
 import logging
 import os
+import re
+import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -688,6 +691,170 @@ def test_poppler_page_text_handles_subprocess_failure(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING):
         out = TextExtractor()._poppler_page_text("x.pdf", [0])
     assert out == {}
+
+
+_OLE2_HEADER = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+_DOC_FIXTURE = Path(__file__).parent / "fixtures" / "doc" / "edital.doc"
+
+
+class _AntiwordProc:
+    def __init__(self, returncode=0, stdout=b""):
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+def _write_bytes(tmp_path, name, data):
+    path = tmp_path / name
+    path.write_bytes(data)
+    return str(path)
+
+
+def _ole2_doc(tmp_path):
+    return _write_bytes(tmp_path, "edital.doc", _OLE2_HEADER + b"\x00" * 504)
+
+
+def _fake_antiword(monkeypatch, proc=None, exc=None, which="/usr/bin/antiword"):
+    import goblintools.parser as p
+
+    calls = []
+    monkeypatch.setattr(p.shutil, "which", lambda name: which if name == "antiword" else None)
+
+    def fake_run(cmd, **kw):
+        calls.append((cmd, kw))
+        if exc is not None:
+            raise exc
+        return proc or _AntiwordProc()
+
+    monkeypatch.setattr(p.subprocess, "run", fake_run)
+    return calls
+
+
+def _antiword_messages(caplog):
+    return [r.getMessage() for r in caplog.records if "antiword" in r.getMessage()]
+
+
+def test_doc_extension_has_parser():
+    assert ".doc" in TextExtractor().parsers
+
+
+def test_extract_doc_ole2_runs_antiword_with_utf8_mapping(tmp_path, monkeypatch):
+    path = _ole2_doc(tmp_path)
+    calls = _fake_antiword(monkeypatch, _AntiwordProc(0, "Licitação pública".encode("utf-8")))
+    assert TextExtractor()._extract_doc(path) == "Licitação pública"
+    cmd, kw = calls[0]
+    assert cmd == ["/usr/bin/antiword", "-m", "UTF-8.txt", "--", path]
+    assert kw["timeout"] == 60
+    assert kw["capture_output"] is True
+    assert kw["check"] is False
+    assert not kw.get("shell")
+
+
+def test_extract_from_file_doc_returns_tagged_text(tmp_path, monkeypatch):
+    path = _ole2_doc(tmp_path)
+    body = "EDITAL DE LICITAÇÃO pregão eletrônico para aquisição de material de expediente"
+    _fake_antiword(monkeypatch, _AntiwordProc(0, body.encode("utf-8")))
+    out = TextExtractor().extract_from_file(path)
+    assert out.startswith(f'file_path_pwd:"{path}"')
+    assert body in out
+
+
+def test_extract_doc_routes_rtf_content_to_rtf_extractor(tmp_path, monkeypatch):
+    path = _write_bytes(tmp_path, "edital.doc", rb"{\rtf1\ansi Edital de licitacao publica}")
+    calls = _fake_antiword(monkeypatch)
+    assert "Edital de licitacao publica" in TextExtractor()._extract_doc(path)
+    assert calls == []
+
+
+def test_extract_doc_routes_ooxml_content_to_docx_extractor(tmp_path, monkeypatch):
+    import docx
+
+    document = docx.Document()
+    document.add_paragraph("Termo de referência do pregão")
+    path = str(tmp_path / "edital.doc")
+    document.save(path)
+    calls = _fake_antiword(monkeypatch)
+    assert "Termo de referência do pregão" in TextExtractor()._extract_doc(path)
+    assert calls == []
+
+
+def test_extract_doc_unknown_content_returns_empty_with_warning(tmp_path, monkeypatch, caplog):
+    path = _write_bytes(tmp_path, "edital.doc", b"plain bytes that are not a word file")
+    calls = _fake_antiword(monkeypatch)
+    with caplog.at_level(logging.WARNING):
+        assert TextExtractor()._extract_doc(path) == ""
+    assert calls == []
+    assert "edital.doc" in caplog.text
+
+
+def test_extract_doc_unreadable_file_returns_empty(tmp_path, monkeypatch, caplog):
+    calls = _fake_antiword(monkeypatch)
+    with caplog.at_level(logging.WARNING):
+        assert TextExtractor()._extract_doc(str(tmp_path / "missing.doc")) == ""
+    assert calls == []
+
+
+def test_extract_doc_without_antiword_warns_once(tmp_path, monkeypatch, caplog):
+    path = _ole2_doc(tmp_path)
+    calls = _fake_antiword(monkeypatch, which=None)
+    extractor = TextExtractor()
+    with caplog.at_level(logging.WARNING):
+        assert extractor._extract_doc(path) == ""
+        assert extractor._extract_doc(path) == ""
+    assert calls == []
+    assert len(_antiword_messages(caplog)) == 1
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        subprocess.TimeoutExpired(["antiword"], 60),
+        OSError("exec format error"),
+    ],
+)
+def test_extract_doc_antiword_failure_returns_empty(tmp_path, monkeypatch, caplog, exc):
+    path = _ole2_doc(tmp_path)
+    _fake_antiword(monkeypatch, exc=exc)
+    with caplog.at_level(logging.WARNING):
+        assert TextExtractor()._extract_doc(path) == ""
+    assert _antiword_messages(caplog)
+
+
+def test_extract_doc_antiword_nonzero_exit_returns_empty(tmp_path, monkeypatch, caplog):
+    path = _ole2_doc(tmp_path)
+    _fake_antiword(monkeypatch, _AntiwordProc(1, b"partial"))
+    with caplog.at_level(logging.WARNING):
+        assert TextExtractor()._extract_doc(path) == ""
+    assert any("exited 1" in m for m in _antiword_messages(caplog))
+
+
+def test_extract_doc_antiword_output_over_limit_is_discarded(tmp_path, monkeypatch, caplog):
+    import goblintools.parser as p
+
+    path = _ole2_doc(tmp_path)
+    monkeypatch.setattr(p, "_ANTIWORD_MAX_BYTES", 10)
+    _fake_antiword(monkeypatch, _AntiwordProc(0, b"x" * 11))
+    with caplog.at_level(logging.WARNING):
+        assert TextExtractor()._extract_doc(path) == ""
+    assert any("exceeds" in m for m in _antiword_messages(caplog))
+
+
+def test_extract_doc_invalid_utf8_is_replaced(tmp_path, monkeypatch):
+    path = _ole2_doc(tmp_path)
+    _fake_antiword(monkeypatch, _AntiwordProc(0, b"Edital \xff final"))
+    assert TextExtractor()._extract_doc(path) == "Edital � final"
+
+
+
+@pytest.mark.skipif(
+    shutil.which("antiword") is None or not _DOC_FIXTURE.exists(),
+    reason="antiword binary or tests/fixtures/doc/edital.doc not available",
+)
+def test_extract_doc_real_word_file_keeps_portuguese_accents():
+    text = TextExtractor()._extract_doc(str(_DOC_FIXTURE))
+    assert len(text.split()) > 50
+    assert re.search(r"[áâãàéêíóôõúçÁÂÃÀÉÊÍÓÔÕÚÇ]", text)
+    assert "�" not in text
+
 
 
 # --- ExtractionReport wiring -----------------------------------------------

@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 class FileValidator:
     # Extensions supported by TextExtractor (kept in sync with parser.py)
     PARSEABLE_EXTENSIONS = frozenset({
-        '.pdf', '.docx', '.txt', '.pptx', '.html', '.odt', '.rtf',
+        '.pdf', '.doc', '.docx', '.txt', '.pptx', '.html', '.odt', '.rtf',
         '.csv', '.xml', '.xlsx', '.xlsm', '.xls', '.ods', '.dbf',
         '.jpg', '.jpeg', '.png', '.tif', '.tiff',
     })
