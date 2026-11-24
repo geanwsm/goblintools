@@ -1,4 +1,5 @@
 """Tests for FileValidator, ArchiveHandler, FileManager."""
+import logging
 import os
 import tempfile
 import zipfile
@@ -507,3 +508,169 @@ def test_misnamed_docx_is_copied_with_the_docx_extension(tmp_path, name):
     assert FileManager.extract_files_recursive(str(source), str(tmp_path / "out"))
 
     assert _files_under(tmp_path / "out") == ["anexo.docx"]
+
+
+_FIXTURES = Path(__file__).parent / "fixtures"
+_DOC_FIXTURE = _FIXTURES / "doc" / "edital.doc"
+_XLS_FIXTURE = _FIXTURES / "xls" / "planilha.xls"
+_OLE2_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+def _pdf_bytes(text="Pregao eletronico para aquisicao de material de expediente municipal"):
+    canvas = pytest.importorskip("reportlab.pdfgen.canvas")
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer)
+    pdf.drawString(72, 720, text)
+    pdf.save()
+    return buffer.getvalue()
+
+
+def _png_bytes():
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), "white").save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def test_detect_extension_from_magic_word_ole2_is_doc():
+    assert FileValidator.detect_extension_from_magic(str(_DOC_FIXTURE)) == ".doc"
+
+
+def test_detect_extension_from_magic_excel_ole2_is_xls():
+    assert FileValidator.detect_extension_from_magic(str(_XLS_FIXTURE)) == ".xls"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _OLE2_SIGNATURE,
+        _OLE2_SIGNATURE + b"\x00" * 504,
+        _OLE2_SIGNATURE + b"\xff" * 4096,
+    ],
+)
+def test_detect_extension_from_magic_broken_ole2_is_none(tmp_path, payload):
+    path = tmp_path / "quebrado"
+    path.write_bytes(payload)
+    assert FileValidator.detect_extension_from_magic(str(path)) is None
+
+
+def test_detect_extension_from_magic_ole2_without_word_or_excel_is_none(tmp_path):
+    data = bytearray(_DOC_FIXTURE.read_bytes())
+    target = "WordDocument".encode("utf-16-le")
+    index = data.find(target)
+    assert index > 0
+    data[index:index + len(target)] = "PowerPointDo".encode("utf-16-le")
+    path = tmp_path / "apresentacao"
+    path.write_bytes(bytes(data))
+    assert FileValidator.detect_extension_from_magic(str(path)) is None
+
+
+@pytest.mark.parametrize("name", ["EDITAL", "edital.bin"])
+@pytest.mark.parametrize(
+    "kind, expected_ext",
+    [
+        ("pdf", ".pdf"),
+        ("rtf", ".rtf"),
+        ("png", ".png"),
+        ("doc", ".doc"),
+        ("xls", ".xls"),
+    ],
+)
+def test_unknown_or_missing_extension_is_copied_with_the_detected_extension(
+    tmp_path, name, kind, expected_ext
+):
+    payloads = {
+        "pdf": _pdf_bytes,
+        "rtf": lambda: rb"{\rtf1\ansi Edital de licitacao publica}",
+        "png": _png_bytes,
+        "doc": _DOC_FIXTURE.read_bytes,
+        "xls": _XLS_FIXTURE.read_bytes,
+    }
+    source = tmp_path / "raw" / name
+    source.parent.mkdir()
+    source.write_bytes(payloads[kind]())
+
+    assert FileManager.extract_files_recursive(str(source), str(tmp_path / "out"))
+
+    assert _files_under(tmp_path / "out") == [f"{Path(name).stem}{expected_ext}"]
+
+
+@pytest.mark.parametrize("name", ["EDITAL", "edital.bin"])
+def test_zip_without_known_extension_is_extracted(tmp_path, name):
+    source = tmp_path / "raw" / name
+    source.parent.mkdir()
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as zf:
+        zf.writestr("edital.pdf", _pdf_bytes())
+    source.write_bytes(payload.getvalue())
+
+    assert FileManager.extract_files_recursive(str(source), str(tmp_path / "out"))
+
+    assert _files_under(tmp_path / "out") == ["edital.pdf"]
+
+
+@pytest.mark.parametrize("name", ["EDITAL", "edital.bin"])
+def test_unknown_content_without_known_extension_is_skipped_with_warning(tmp_path, caplog, name):
+    source = tmp_path / "raw" / name
+    source.parent.mkdir()
+    source.write_bytes(b"conteudo qualquer sem tipo reconhecivel")
+
+    with caplog.at_level(logging.WARNING):
+        assert FileManager.extract_files_recursive(str(source), str(tmp_path / "out")) is False
+
+    assert _files_under(tmp_path / "out") == []
+    assert name in caplog.text
+
+
+def test_known_extension_keeps_its_name_without_content_detection(tmp_path):
+    source = tmp_path / "raw" / "edital.pdf"
+    source.parent.mkdir()
+    source.write_bytes(_pdf_bytes())
+
+    assert FileManager.extract_files_recursive(str(source), str(tmp_path / "out"))
+
+    assert _files_under(tmp_path / "out") == ["edital.pdf"]
+
+
+def test_extensionless_pdf_reaches_the_text_extractor(tmp_path):
+    from goblintools import TextExtractor
+
+    source = tmp_path / "raw" / "EDITAL"
+    source.parent.mkdir()
+    source.write_bytes(_pdf_bytes())
+    cache = tmp_path / "cache"
+
+    FileManager.extract_files_recursive(str(source), str(cache))
+    text = TextExtractor(ocr_handler=False).extract_from_folder(str(cache))
+
+    assert "Pregao eletronico" in text
+    assert "EDITAL.pdf" in text
+
+
+def test_extensionless_xls_reaches_the_text_extractor(tmp_path):
+    from goblintools import TextExtractor
+
+    source = tmp_path / "raw" / "PLANILHA"
+    source.parent.mkdir()
+    source.write_bytes(_XLS_FIXTURE.read_bytes())
+    cache = tmp_path / "cache"
+
+    FileManager.extract_files_recursive(str(source), str(cache))
+    text = TextExtractor(ocr_handler=False).extract_from_folder(str(cache))
+
+    assert "Papel sulfite" in text
+
+
+def test_zip_without_extension_is_extracted_when_patool_cannot_tell(tmp_path, monkeypatch):
+    monkeypatch.setattr(FileValidator, "is_archive", staticmethod(lambda _path: False))
+    source = tmp_path / "raw" / "EDITAL"
+    source.parent.mkdir()
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as zf:
+        zf.writestr("edital.pdf", _pdf_bytes())
+    source.write_bytes(payload.getvalue())
+
+    assert FileManager.extract_files_recursive(str(source), str(tmp_path / "out"))
+
+    assert _files_under(tmp_path / "out") == ["edital.pdf"]

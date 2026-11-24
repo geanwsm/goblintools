@@ -1,3 +1,5 @@
+import io
+import mmap
 import os
 import shutil
 import zipfile
@@ -14,6 +16,25 @@ from goblintools.retry import retry_with_backoff
 from goblintools.log_policy import _set_suppress_warnings, log_warning
 
 logger = logging.getLogger(__name__)
+
+_OLE2_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+def _ole2_extension(file_path: str) -> Optional[str]:
+    try:
+        from xlrd.compdoc import CompDoc
+
+        with open(file_path, 'rb') as f:
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mem:
+                names = {entry.name for entry in CompDoc(mem, logfile=io.StringIO()).dirlist}
+    except Exception:  # noqa: BLE001
+        return None
+    if 'WordDocument' in names:
+        return '.doc'
+    if 'Workbook' in names or 'Book' in names:
+        return '.xls'
+    return None
+
 
 class FileValidator:
     # Extensions supported by TextExtractor (kept in sync with parser.py)
@@ -83,6 +104,8 @@ class FileValidator:
             stripped = sniff.lstrip()
             if stripped.startswith(b'{\\rtf'):
                 return '.rtf'
+            if header == _OLE2_SIGNATURE:
+                return _ole2_extension(file_path)
             # Office Open XML (ZIP): extensionless docx/xlsx/pptx inside archives
             if header.startswith(b'PK\x03\x04'):
                 try:
@@ -648,23 +671,28 @@ class FileManager:
             shutil.copy2(file_path, dest_file)
             return True
 
-        # Case B fallback when is_archive is False (e.g. patool detects PDF in .zip)
-        ext = Path(file_path).suffix.lower()
-        if ext in ArchiveHandler._SUPPORTED_FORMATS:
-            actual_ext = FileValidator.detect_extension_from_magic(file_path)
-            if actual_ext and actual_ext in FileValidator.PARSEABLE_EXTENSIONS:
-                os.makedirs(destination, exist_ok=True)
-                stem = Path(file_path).stem
-                dest_file = os.path.join(destination, f"{stem}{actual_ext}")
-                base, ext_suffix = os.path.splitext(dest_file)
-                counter = 1
-                while os.path.exists(dest_file):
-                    dest_file = f"{base}_{counter}{ext_suffix}"
-                    counter += 1
-                shutil.copy2(file_path, dest_file)
-                logger.info(f"Treating misnamed file as {actual_ext}: {file_path}")
+        if FileValidator.is_zip_by_magic(file_path):
+            if ArchiveHandler.extract_zip(file_path, destination, budget=budget):
+                cls._extract_nested(destination, budget, _depth)
+                logger.info(f"Treating unrecognised file as ZIP: {file_path}")
                 return True
 
+        # Case B fallback when is_archive is False (e.g. patool detects PDF in .zip)
+        actual_ext = FileValidator.detect_extension_from_magic(file_path)
+        if actual_ext and actual_ext in FileValidator.PARSEABLE_EXTENSIONS:
+            os.makedirs(destination, exist_ok=True)
+            stem = Path(file_path).stem
+            dest_file = os.path.join(destination, f"{stem}{actual_ext}")
+            base, ext_suffix = os.path.splitext(dest_file)
+            counter = 1
+            while os.path.exists(dest_file):
+                dest_file = f"{base}_{counter}{ext_suffix}"
+                counter += 1
+            shutil.copy2(file_path, dest_file)
+            logger.info(f"Treating misnamed file as {actual_ext}: {file_path}")
+            return True
+
+        log_warning(logger, f"Unsupported file type, skipping: {file_path}")
         return False
 
     @classmethod
