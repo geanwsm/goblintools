@@ -726,6 +726,10 @@ The PDF's font maps character codes to custom glyph names with no working `/ToUn
 
 ---
 
+## Release highlights (0.16.1)
+
+- **OCR log reports the pages actually sent to OCR**: after a per-page OCR fallback (or glyph-garbage recovery) a PDF read as `clean` logged `scanned PDF re-read end to end via OCR (N page(s))` with the total page count, as if the whole document had gone through OCR (and Textract billing). The message is now `OCR recovered K of N page(s)`, where K counts the pages re-read by OCR. The whole-document OCR path keeps the `re-read end to end` message. Log-only change: extraction output, `ExtractionReport` and statuses are unchanged.
+
 ## Release highlights (0.16.0)
 
 - **Word 97–2003 `.doc` support**: `.doc` files used to return empty text ("No parser available"), so a bidding notice shipped only as `.doc` produced no content. They are now read with the `antiword` binary, with UTF-8 output so Portuguese accents survive, a 60 s timeout and a 64 MB output cap; a failure, timeout or oversized output returns empty text with a warning instead of raising. A `.doc` whose content is actually RTF or DOCX (a common rename) is routed by content to the RTF or DOCX extractor. Without `antiword` on `PATH`, `.doc` files return empty text and a single warning is logged per extractor. `.doc` is also a parseable document for `FileManager` now, so it is copied out of archives like `.docx`.

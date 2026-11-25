@@ -1305,8 +1305,9 @@ class TextExtractor(ThreadLocalStateMixin):
         report.recompute_overall()
         if report.demote_to_clean_if_fully_ocr_recovered():
             logger.info(
-                "%s: scanned PDF re-read end to end via OCR (%d page(s))",
+                "%s: OCR recovered %d of %d page(s)",
                 file_path,
+                sum(1 for pe in report.pages if pe.status == RECOVERED and pe.engine == "ocr"),
                 len(report.pages),
             )
         self.last_extraction_report = report

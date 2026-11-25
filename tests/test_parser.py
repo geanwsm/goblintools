@@ -1483,3 +1483,58 @@ def test_text_extractor_survives_pickle_without_its_thread_state(sample_txt_file
     assert restored.last_extraction_reports == {}
     assert restored.last_extraction_report is None
     assert "file_path_pwd" in restored.extract_from_file(sample_txt_file)
+
+
+def test_partial_ocr_fallback_logs_pages_sent_to_ocr(caplog):
+    good = (
+        "Contratacao de empresa especializada para fornecimento de material de consumo "
+        "conforme termo de referencia e condicoes estabelecidas neste edital de licitacao."
+    )
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        path = f.name
+    try:
+        writer = PdfWriter()
+        for _ in range(3):
+            writer.add_blank_page(width=200, height=200)
+        with open(path, "wb") as fh:
+            writer.write(fh)
+        ex = TextExtractor()
+        ex.ocr_handler = MagicMock()
+        ex.ocr_handler.extract_text_from_pdf_page_indices.return_value = {
+            1: "TEXTO RECUPERADO VIA OCR para a pagina do meio do edital de licitacao."
+        }
+        ex.ocr_handler.last_failed_pages = {}
+        with patch.object(
+            ex, "_pypdf_extract_pages", return_value=([good, "", good], {1}, False)
+        ), caplog.at_level(logging.INFO, logger="goblintools.parser"):
+            ex.extract_from_file(path)
+        assert "OCR recovered 1 of 3 page(s)" in caplog.text
+        assert "re-read end to end" not in caplog.text
+        assert ex.last_extraction_report.overall_status == "clean"
+    finally:
+        os.unlink(path)
+
+
+def test_whole_document_ocr_logs_re_read_end_to_end_with_total_pages(monkeypatch, caplog):
+    pytest.importorskip("reportlab")
+    import goblintools.parser as p
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        path = f.name
+    try:
+        _write_pdf_lines(
+            path,
+            "Contratacao de empresa para fornecimento de material de consumo conforme "
+            "termo de referencia. Valor total estimado dez mil reais. Pregao eletronico.",
+        )
+        monkeypatch.setattr(p, "_substitution_cipher_score", lambda *a, **k: 0.25)
+        ex = TextExtractor()
+        ex.ocr_handler = MagicMock()
+        ex.ocr_handler.extract_text_from_pdf.return_value = "TEXTO LIMPO RECUPERADO VIA OCR."
+        with caplog.at_level(logging.INFO, logger="goblintools.parser"):
+            ex.extract_from_file(path)
+        total = len(ex.last_extraction_report.pages)
+        assert f"re-read end to end via OCR ({total} page(s))" in caplog.text
+        assert "OCR recovered" not in caplog.text
+    finally:
+        os.unlink(path)
